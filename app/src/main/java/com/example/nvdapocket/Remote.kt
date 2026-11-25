@@ -68,8 +68,8 @@ object Remote {
 
     fun applyTts() { tts?.setSpeechRate(ttsRate); tts?.setPitch(ttsPitch) }
 
-    fun setSpeak(b: Boolean) { speak = b; if (!b) tts?.stop(); publish() }
-    fun toggleMute() { setSpeak(!speak); vibrate(60) }
+    fun applySpeak(b: Boolean) { speak = b; if (!b) tts?.stop(); publish() }
+    fun toggleMute() { applySpeak(!speak); vibrate(60) }
 
     fun say(msg: String) { if (ttsReady) tts?.speak(msg, TextToSpeech.QUEUE_ADD, null, "local") }
 
@@ -208,13 +208,33 @@ object Remote {
         return true
     }
 
-    fun sendText(s: String) {
+    /** Types the text as key presses. Returns how many characters could not be typed. */
+    fun sendText(s: String): Int {
+        var skipped = 0
         for (c in s) {
-            val (vk, shift) = charToKey(c) ?: continue
+            val k = charToKey(c)
+            if (k == null) { skipped++; continue }
+            val (vk, shift) = k
             val needShift = shift && !held.contains(0x10)
             if (needShift) sendKey(0x10, false, true)
             tap(vk)
             if (needShift) sendKey(0x10, false, false)
+        }
+        return skipped
+    }
+
+    fun pushText(t: String) { sendJson(JSONObject().put("type", "set_clipboard_text").put("text", t)) }
+
+    /** mode: "clip" = PC clipboard only, "paste" = clipboard then Ctrl+V, anything else = type as keys. */
+    fun deliver(mode: String, text: String): String {
+        if (!connected) return "Not connected"
+        return when (mode) {
+            "clip" -> { pushText(text); vibrate(40); "Copied to the PC clipboard" }
+            "paste" -> { pushText(text); ui.postDelayed({ combo(0x11, 0x56) }, 400); vibrate(40); "Pasting on the PC" }
+            else -> {
+                val skipped = sendText(text)
+                if (skipped > 0) "Typed. $skipped characters could not be typed (use the clipboard for those)" else "Typed on the PC"
+            }
         }
     }
 

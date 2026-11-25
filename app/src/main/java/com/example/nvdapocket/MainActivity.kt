@@ -346,6 +346,19 @@ class MainActivity : Activity() {
         p.addView(button("Send phone clipboard to PC") {
             toast(if (Remote.pushClipboard(this)) "Clipboard sent" else "Clipboard is empty or not connected")
         })
+        p.addView(label("Send text to the PC"))
+        val sendBox = field("Text to send (any language works with the clipboard)", "")
+        sendBox.setSingleLine(false)
+        p.addView(sendBox)
+        fun deliverBox(mode: String) {
+            val t = sendBox.text.toString()
+            if (t.isEmpty()) { toast("Type something first"); return }
+            toast(Remote.deliver(mode, t))
+        }
+        p.addView(row(
+            button("To clipboard") { deliverBox("clip") },
+            button("Clipboard + paste") { deliverBox("paste") },
+            button("Type it") { deliverBox("type") }))
         p.addView(button("Release all held keys") { releaseAll() })
     }
 
@@ -750,7 +763,7 @@ class MainActivity : Activity() {
     private fun buildSettings(p: LinearLayout) {
         p.addView(label("Speech from the PC"))
         speakBox = check("Speak remote speech on this phone", Remote.speak)
-        speakBox.setOnCheckedChangeListener { _, c -> if (c != Remote.speak) Remote.setSpeak(c); updateUi() }
+        speakBox.setOnCheckedChangeListener { _, c -> if (c != Remote.speak) Remote.applySpeak(c); updateUi() }
         p.addView(speakBox)
         seekRow(p, 30, ((Remote.ttsRate - 0.5f) / 0.05f).toInt(), { v -> "Speech speed: %.2f".format(0.5f + v * 0.05f) },
             { v -> Remote.ttsRate = 0.5f + v * 0.05f; Remote.applyTts(); prefs.edit().putFloat("rate", Remote.ttsRate).apply() })
@@ -762,6 +775,21 @@ class MainActivity : Activity() {
         val shake = check("Shake the phone to mute or unmute speech (applies next time you connect)", prefs.getBoolean("shake", true))
         shake.setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("shake", c).apply() }
         p.addView(shake)
+
+        p.addView(label("When I share text to NVDA Pocket from another app"))
+        val modes = listOf("Ask each time" to "ask", "Put it in the PC clipboard" to "clip",
+            "Put in clipboard and paste (Ctrl+V)" to "paste", "Type it as keys" to "type")
+        val shareSpinner = Spinner(this)
+        shareSpinner.adapter = ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item, modes.map { it.first })
+        shareSpinner.setSelection(maxOf(0, modes.indexOfFirst { it.second == (prefs.getString("shareMode", "ask") ?: "ask") }))
+        shareSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                prefs.edit().putString("shareMode", modes[pos].second).apply()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        p.addView(shareSpinner)
+        p.addView(TextView(this).apply { text = "In any app choose Share, then \"Send to PC\". The clipboard works for every language including Arabic. Typing only supports US keyboard characters." })
 
         p.addView(label("Controls"))
         volumeBox = check("Volume keys act as Up and Down arrows", false)
