@@ -434,11 +434,11 @@ class MainActivity : Activity() {
         "delete" to Pair(0x2E, true), "up" to Pair(0x26, true), "down" to Pair(0x28, true),
         "left" to Pair(0x25, true), "right" to Pair(0x27, true), "home" to Pair(0x24, true),
         "end" to Pair(0x23, true), "pageup" to Pair(0x21, true), "pagedown" to Pair(0x22, true),
-        "insert" to Pair(0x2D, true), "nvda" to Pair(0x2D, true), "capslock" to Pair(0x14, false),
+        "capslock" to Pair(0x14, false),
         "applications" to Pair(0x5D, true), "menu" to Pair(0x5D, true))
     private val modWords = mapOf(
         "control" to Pair(0x11, false), "ctrl" to Pair(0x11, false), "alt" to Pair(0x12, false),
-        "shift" to Pair(0x10, false), "windows" to Pair(0x5B, true), "window" to Pair(0x5B, true), "win" to Pair(0x5B, true))
+        "shift" to Pair(0x10, false), "insert" to Pair(0x2D, true), "nvda" to Pair(0x2D, true), "windows" to Pair(0x5B, true), "window" to Pair(0x5B, true), "win" to Pair(0x5B, true))
 
     private fun numOf(t: String): Int? = t.toIntOrNull() ?: numWords[t]
 
@@ -449,7 +449,7 @@ class MainActivity : Activity() {
             if (s.startsWith(p)) { Remote.sendText(raw.trim().substring(p.length)); return }
         }
         s = s.replace("page up", "pageup").replace("page down", "pagedown").replace("caps lock", "capslock")
-            .replace("back space", "backspace").replace("arrow", "").replace(",", " ").replace(".", " ")
+            .replace("back space", "backspace").replace("n v d a", "nvda").replace("insert plus", "insert").replace("arrow", "").replace(",", " ").replace(".", " ")
         val skip = setOf("press", "hit", "key", "then", "and", "the", "times", "time")
         val toks = s.split(Regex("\\s+")).filter { it.isNotEmpty() && it !in skip }
         val mods = mutableListOf<Pair<Int, Boolean>>()
@@ -489,6 +489,7 @@ class MainActivity : Activity() {
             mods.clear()
             understood = true
         }
+        if (mods.isNotEmpty()) { mods.forEach { Remote.tap(it.first, it.second) }; understood = true }
         if (!understood) voiceStatus.text = "Heard: $raw (not a command)"
     }
 }
