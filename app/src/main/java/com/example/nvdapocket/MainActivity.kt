@@ -51,7 +51,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
         val host = field("Server host", prefs.getString("host", "") ?: "")
         val port = field("Port", prefs.getString("port", "6837") ?: "6837", true)
-        val key = field("Key", prefs.getString("key", "") ?: "")
+        val keyField = field("Key", prefs.getString("key", "") ?: "")
         val trustAll = CheckBox(this).apply { text = "Accept untrusted certificate"; isChecked = prefs.getBoolean("trust", false) }
         speakBox = CheckBox(this).apply { text = "Speak remote speech on this phone"; isChecked = true }
         status = TextView(this).apply {
@@ -62,11 +62,11 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         connectBtn.setOnClickListener {
             if (connected) { disconnect(); return@setOnClickListener }
             prefs.edit().putString("host", host.text.toString()).putString("port", port.text.toString())
-                .putString("key", key.text.toString()).putBoolean("trust", trustAll.isChecked).apply()
+                .putString("key", keyField.text.toString()).putBoolean("trust", trustAll.isChecked).apply()
             connect(host.text.toString().trim(), port.text.toString().toIntOrNull() ?: 6837,
-                key.text.toString().trim(), trustAll.isChecked)
+                keyField.text.toString().trim(), trustAll.isChecked)
         }
-        listOf<View>(host, port, key, trustAll, speakBox, connectBtn, status).forEach { root.addView(it) }
+        listOf<View>(host, port, keyField, trustAll, speakBox, connectBtn, status).forEach { root.addView(it) }
 
         // Modifiers (stay held until toggled off)
         root.addView(label("Modifier keys (toggle to hold)"))
@@ -89,13 +89,13 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         root.addView(release)
 
         root.addView(label("Type text"))
-        val text = field("Text to type on the PC", "")
-        text.setSingleLine(false)
+        val textBox = field("Text to type on the PC", "")
+        textBox.setSingleLine(false)
         val send = Button(this).apply { text = "Send text" }
-        send.setOnClickListener { sendText(text.text.toString()); text.setText("") }
+        send.setOnClickListener { sendText(textBox.text.toString()); textBox.setText("") }
         val sendEnter = Button(this).apply { text = "Send text and Enter" }
-        sendEnter.setOnClickListener { sendText(text.text.toString() + "\n"); text.setText("") }
-        root.addView(text); root.addView(send); root.addView(sendEnter)
+        sendEnter.setOnClickListener { sendText(textBox.text.toString() + "\n"); textBox.setText("") }
+        root.addView(textBox); root.addView(send); root.addView(sendEnter)
     }
 
     // ---------- UI helpers ----------
