@@ -9,8 +9,23 @@ android {
         applicationId = "com.example.nvdapocket"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = (project.findProperty("verCode") as String?)?.toIntOrNull() ?: 1
+        versionName = "3.0"
+    }
+    signingConfigs {
+        create("main") {
+            storeFile = file("nvdapocket.jks")
+            storePassword = "nvdapocket"
+            keyAlias = "nvdapocket"
+            keyPassword = "nvdapocket"
+        }
+    }
+    buildTypes {
+        getByName("debug") { signingConfig = signingConfigs.getByName("main") }
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("main")
+            isMinifyEnabled = false
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

@@ -6,6 +6,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <queries>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
     </queries>
@@ -27,5 +28,15 @@
             android:name=".RemoteService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".ConnectTile"
+            android:exported="true"
+            android:label="NVDA Pocket"
+            android:icon="@android:drawable/ic_dialog_info"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

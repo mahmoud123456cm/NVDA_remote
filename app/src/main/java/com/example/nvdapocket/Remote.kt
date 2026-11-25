@@ -1,10 +1,13 @@
 package com.example.nvdapocket
 
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.speech.tts.TextToSpeech
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -25,24 +28,65 @@ object Remote {
     @Volatile var active = false       // user wants to be connected (auto-reconnects)
     @Volatile var connected = false    // socket currently up
     @Volatile var speak = true
+    @Volatile var peers = 0            // controlled PCs seen in the channel
+    @Volatile var recording: MutableList<String>? = null
     @Volatile private var generation = 0
+    var ttsRate = 1f
+    var ttsPitch = 1f
+    private var appCtx: Context? = null
     private var socket: SSLSocket? = null
     private var writer: PrintWriter? = null
     private val sender = Executors.newSingleThreadExecutor()
     private val ui = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var base = "Not connected"
     var lastStatus = "Not connected"
     var statusListener: ((String) -> Unit)? = null
+    var serviceListener: ((String) -> Unit)? = null
     val held = mutableSetOf<Int>()
 
-    fun setStatus(s: String) { lastStatus = s; ui.post { statusListener?.invoke(s) } }
+    // ---------- status ----------
+    private fun compose(): String =
+        if (connected) "Connected | " + (if (peers > 0) "PC online" else "waiting for PC") + (if (!speak) " | speech muted" else "")
+        else base
 
-    fun start(ctx: Context, host: String, port: Int, chan: String, trust: Boolean) {
+    fun publish() {
+        val t = compose()
+        lastStatus = t
+        ui.post { statusListener?.invoke(t); serviceListener?.invoke(t) }
+    }
+
+    fun setStatus(s: String) { base = s; publish() }
+
+    // ---------- speech / feedback ----------
+    fun initTts(ctx: Context) {
         val app = ctx.applicationContext
-        if (tts == null) tts = TextToSpeech(app) { ttsReady = it == TextToSpeech.SUCCESS }
+        appCtx = app
+        if (tts == null) tts = TextToSpeech(app) { st -> ttsReady = st == TextToSpeech.SUCCESS; if (ttsReady) applyTts() }
+    }
+
+    fun applyTts() { tts?.setSpeechRate(ttsRate); tts?.setPitch(ttsPitch) }
+
+    fun setSpeak(b: Boolean) { speak = b; if (!b) tts?.stop(); publish() }
+    fun toggleMute() { setSpeak(!speak); vibrate(60) }
+
+    fun say(msg: String) { if (ttsReady) tts?.speak(msg, TextToSpeech.QUEUE_ADD, null, "local") }
+
+    fun vibrate(ms: Long) {
+        val c = appCtx ?: return
+        val v = c.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+        if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+        else v.vibrate(ms)
+    }
+
+    // ---------- connection ----------
+    fun start(ctx: Context, host: String, port: Int, chan: String, trust: Boolean) {
+        initTts(ctx)
+        val app = ctx.applicationContext
         closeSocket()
         active = true
+        peers = 0
         generation++
         val gen = generation
         val svc = Intent(app, RemoteService::class.java)
@@ -55,6 +99,7 @@ object Remote {
                     if (active && gen == generation) setStatus("Error: ${e.message}")
                 }
                 connected = false
+                peers = 0
                 if (!(active && gen == generation)) break
                 setStatus("Connection lost. Reconnecting in 5 seconds...")
                 try { Thread.sleep(5000) } catch (_: InterruptedException) {}
@@ -66,6 +111,7 @@ object Remote {
         active = false
         generation++
         connected = false
+        peers = 0
         closeSocket()
         ctx.applicationContext.stopService(Intent(ctx.applicationContext, RemoteService::class.java))
         tts?.stop()
@@ -97,7 +143,7 @@ object Remote {
         connected = true
         sendJson(JSONObject().put("type", "protocol_version").put("version", 2))
         sendJson(JSONObject().put("type", "join").put("channel", chan).put("connection_type", "master"))
-        setStatus("Connected, joined channel")
+        publish()
         val r = BufferedReader(InputStreamReader(s.getInputStream()))
         r.forEachLine { handle(it) }
     }
@@ -113,10 +159,28 @@ object Remote {
                 if (t.isNotEmpty() && speak && ttsReady) tts?.speak(t, TextToSpeech.QUEUE_ADD, null, null)
             }
             "cancel" -> if (ttsReady) tts?.stop()
-            "channel_joined" -> setStatus("Connected, channel joined")
-            "client_joined" -> setStatus("Connected, PC joined the channel")
-            "client_left" -> setStatus("Connected, PC left the channel")
-            "motd" -> setStatus("Connected: " + m.optString("motd"))
+            "channel_joined" -> {
+                var n = 0
+                val cl = m.optJSONArray("clients")
+                if (cl != null) for (i in 0 until cl.length()) {
+                    if (cl.optJSONObject(i)?.optString("connection_type") == "slave") n++
+                }
+                peers = n
+                publish()
+            }
+            "client_joined" -> {
+                val ct = m.optJSONObject("client")?.optString("connection_type")
+                if (ct == null || ct == "slave") { peers++; vibrate(40) }
+                publish()
+            }
+            "client_left" -> {
+                val ct = m.optJSONObject("client")?.optString("connection_type")
+                if (ct == null || ct == "slave") {
+                    peers = maxOf(0, peers - 1)
+                    if (peers == 0) { vibrate(150); say("PC disconnected") }
+                }
+                publish()
+            }
         }
     }
 
@@ -125,11 +189,23 @@ object Remote {
         if (!connected) return
         sender.execute { try { writer?.println(o.toString()); writer?.flush() } catch (_: Exception) {} }
     }
-    fun sendKey(vk: Int, ext: Boolean, pressed: Boolean) =
+
+    fun sendKey(vk: Int, ext: Boolean, pressed: Boolean) {
+        recording?.let { r -> synchronized(r) { r.add("$vk,${if (ext) 1 else 0},${if (pressed) 1 else 0}") } }
         sendJson(JSONObject().put("type", "key").put("vk_code", vk).put("extended", ext).put("pressed", pressed))
+    }
+
     fun tap(vk: Int, ext: Boolean = false) { sendKey(vk, ext, true); sendKey(vk, ext, false) }
-    fun combo(mod: Int, vk: Int, ext: Boolean = false) {
-        sendKey(mod, false, true); tap(vk, ext); sendKey(mod, false, false)
+    fun combo(mod: Int, vk: Int, ext: Boolean = false) { sendKey(mod, false, true); tap(vk, ext); sendKey(mod, false, false) }
+
+    fun pushClipboard(ctx: Context): Boolean {
+        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = cm.primaryClip
+        val t = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(ctx)?.toString() else null
+        if (t.isNullOrEmpty()) { vibrate(150); return false }
+        sendJson(JSONObject().put("type", "set_clipboard_text").put("text", t))
+        vibrate(40)
+        return true
     }
 
     fun sendText(s: String) {

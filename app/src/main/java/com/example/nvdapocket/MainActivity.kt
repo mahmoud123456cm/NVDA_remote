@@ -1,9 +1,12 @@
 package com.example.nvdapocket
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -22,117 +25,131 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlin.math.abs
 
 class MainActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
+    private lateinit var prefs: SharedPreferences
     private lateinit var status: TextView
-    private lateinit var voiceStatus: TextView
-    private lateinit var speakBox: CheckBox
-    private lateinit var volumeBox: CheckBox
     private lateinit var connectBtn: Button
-    private lateinit var voiceBtn: Button
-    private lateinit var form: LinearLayout
+    private lateinit var muteBtn: Button
+    private lateinit var content: LinearLayout
+    private val panels = mutableListOf<LinearLayout>()
+    private val tabBtns = mutableListOf<Button>()
+    private val tabNames = listOf("Connect", "Control", "NVDA", "Voice", "Macros", "Settings")
+
+    // connect tab
+    private lateinit var profileSpinner: Spinner
+    private lateinit var nameField: EditText
+    private lateinit var hostField: EditText
+    private lateinit var portField: EditText
+    private lateinit var keyField: EditText
+    private lateinit var trustBox: CheckBox
+    private var profiles = mutableListOf<Store.Profile>()
+
+    // control tab
     private lateinit var capture: KeyCaptureView
-    private var recognizer: SpeechRecognizer? = null
-    private var voiceOn = false
     private var distDp = 100
     private var tapsOn = true
+    private var gMap: MutableMap<String, String> = mutableMapOf()
+
+    // settings tab
+    private lateinit var speakBox: CheckBox
+    private lateinit var volumeBox: CheckBox
+    private lateinit var vibrateBox: CheckBox
+    private lateinit var speakResultBox: CheckBox
+
+    // voice tab
+    private lateinit var voiceBtn: Button
+    private lateinit var voiceStatus: TextView
+    private lateinit var dictBtn: Button
+    private lateinit var wakeBox: CheckBox
+    private lateinit var wakeField: EditText
+    private var recognizer: SpeechRecognizer? = null
+    private var voiceOn = false
+    private var dictationOn = false
+
+    // macros tab
+    private lateinit var macroList: LinearLayout
+    private lateinit var recordBtn: Button
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
-        val prefs = getSharedPreferences("p", MODE_PRIVATE)
+        prefs = Store.prefs(this)
+        Remote.initTts(this)
+        Voice.init(this)
+        Remote.ttsRate = prefs.getFloat("rate", 1f)
+        Remote.ttsPitch = prefs.getFloat("pitch", 1f)
+        Remote.applyTts()
+        Voice.lang = prefs.getString("vlang", "en") ?: "en"
+        gMap = Store.gestureMap(this)
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
         }
-
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(8), dp(8), dp(8)) }
-        setContentView(ScrollView(this).apply { addView(root) })
-
-        fun field(hint: String, value: String, numeric: Boolean = false) = EditText(this).apply {
-            this.hint = hint; setText(value); setSingleLine()
-            contentDescription = hint
-            if (numeric) inputType = InputType.TYPE_CLASS_NUMBER
+        // migrate the single connection saved by older versions
+        val oldHost = prefs.getString("host", "") ?: ""
+        if (Store.profiles(this).isEmpty() && oldHost.isNotEmpty()) {
+            Store.saveProfiles(this, listOf(Store.Profile("Default", oldHost,
+                (prefs.getString("port", "6837") ?: "6837").toIntOrNull() ?: 6837,
+                prefs.getString("key", "") ?: "", prefs.getBoolean("trust", false))))
+            prefs.edit().putString("last", "Default").apply()
         }
-        val host = field("Server host", prefs.getString("host", "") ?: "")
-        val port = field("Port", prefs.getString("port", "6837") ?: "6837", true)
-        val keyField = field("Key", prefs.getString("key", "") ?: "")
-        val trustAll = CheckBox(this).apply { text = "Accept untrusted certificate"; isChecked = prefs.getBoolean("trust", false) }
-        val battery = Button(this).apply { text = "Battery settings (set this app to Unrestricted)" }
-        battery.setOnClickListener { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
-        form = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        listOf<View>(host, port, keyField, trustAll, battery).forEach { form.addView(it) }
 
-        speakBox = CheckBox(this).apply { text = "Speak remote speech on this phone"; isChecked = Remote.speak }
-        speakBox.setOnCheckedChangeListener { _, c -> Remote.speak = c }
-        volumeBox = CheckBox(this).apply { text = "Volume keys act as Up and Down arrows" }
-        status = TextView(this).apply { text = Remote.lastStatus; textSize = 16f }
+        val outer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val header = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(8), dp(8), 0) }
         connectBtn = Button(this).apply { text = "Connect" }
         connectBtn.setOnClickListener {
-            if (Remote.active) { Remote.stop(this); updateUi(); return@setOnClickListener }
-            prefs.edit().putString("host", host.text.toString()).putString("port", port.text.toString())
-                .putString("key", keyField.text.toString()).putBoolean("trust", trustAll.isChecked).apply()
-            val h = host.text.toString().trim(); val k = keyField.text.toString().trim()
-            if (h.isEmpty() || k.isEmpty()) { status.text = "Enter host and key"; return@setOnClickListener }
-            Remote.start(this, h, port.text.toString().toIntOrNull() ?: 6837, k, trustAll.isChecked)
-            updateUi()
+            if (Remote.active) { Remote.stop(this); updateUi() } else connectFromFields()
         }
-        listOf<View>(connectBtn, status, form, speakBox, volumeBox).forEach { root.addView(it) }
+        muteBtn = Button(this).apply { text = "Mute speech" }
+        muteBtn.setOnClickListener { Remote.toggleMute(); updateUi() }
+        val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        top.addView(connectBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        top.addView(muteBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        status = TextView(this).apply { text = Remote.lastStatus; textSize = 16f }
+        header.addView(top); header.addView(status)
+        outer.addView(header)
 
-        // Gesture pad
-        val pad = GesturePad(this)
-        root.addView(pad, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(300)).apply { topMargin = dp(8) })
-
-        val distLabel = TextView(this)
-        val seek = SeekBar(this).apply { max = 160; progress = prefs.getInt("dist", 60) }
-        distDp = 40 + seek.progress
-        distLabel.text = "Gesture distance: $distDp (higher = less sensitive)"
-        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                distDp = 40 + p
-                distLabel.text = "Gesture distance: $distDp (higher = less sensitive)"
-                prefs.edit().putInt("dist", p).apply()
-            }
-            override fun onStartTrackingTouch(sb: SeekBar?) {}
-            override fun onStopTrackingTouch(sb: SeekBar?) {}
-        })
-        tapsOn = prefs.getBoolean("taps", true)
-        val tapBox = CheckBox(this).apply { text = "Taps and hold on the pad (Enter, Space, Alt+Tab, Escape)"; isChecked = tapsOn }
-        tapBox.setOnCheckedChangeListener { _, c -> tapsOn = c; prefs.edit().putBoolean("taps", c).apply() }
-        root.addView(distLabel); root.addView(seek); root.addView(tapBox)
-
-        // Voice
-        voiceBtn = Button(this).apply { text = "Start voice commands" }
-        voiceBtn.setOnClickListener {
-            if (voiceOn) stopVoice() else { voiceOn = true; voiceBtn.text = "Stop voice commands"; startVoice() }
+        val tabRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(dp(4), 0, dp(4), 0) }
+        tabNames.forEachIndexed { i, n ->
+            val tb = Button(this).apply { text = n; isAllCaps = false; textSize = 13f }
+            tb.setOnClickListener { showTab(i) }
+            tabBtns.add(tb); tabRow.addView(tb)
         }
-        voiceStatus = TextView(this).apply { text = "Voice: off" }
-        root.addView(voiceBtn); root.addView(voiceStatus)
+        outer.addView(HorizontalScrollView(this).apply { addView(tabRow) })
 
-        // Live keyboard
-        capture = KeyCaptureView(this)
-        capture.setBackgroundColor(0xFFE0E0E0.toInt())
-        capture.contentDescription = "Live keyboard. Tap to open the keyboard. Everything you type goes straight to the PC."
-        capture.setOnClickListener { showKeyboard() }
-        root.addView(label("Live keyboard (tap here to type)"))
-        root.addView(capture, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(80)))
+        content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        outer.addView(ScrollView(this).apply { addView(content) }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        setContentView(outer)
 
-        root.addView(label("Modifier keys (toggle to hold)"))
-        root.addView(row(mod("Ctrl", 0x11), mod("Alt", 0x12), mod("Shift", 0x10), mod("Win", 0x5B, true), mod("NVDA/Insert", 0x2D, true)))
-        root.addView(label("Extra keys"))
-        root.addView(row(key("Esc", 0x1B), key("Tab", 0x09), key("Enter", 0x0D), key("Space", 0x20), key("Backspace", 0x08)))
-        root.addView(row(key("Home", 0x24, true), key("End", 0x23, true), key("Page up", 0x21, true), key("Page down", 0x22, true)))
-        root.addView(row(key("Delete", 0x2E, true), key("Applications", 0x5D, true), key("Caps lock", 0x14)))
-        for (r in 0 until 2) root.addView(row(*(1..6).map { key("F${r * 6 + it}", 0x70 + r * 6 + it - 1) }.toTypedArray()))
-        val sas = Button(this).apply { text = "Send Ctrl+Alt+Delete" }
-        sas.setOnClickListener { Remote.sendJson(JSONObject().put("type", "send_SAS")) }
-        root.addView(sas)
-        val release = Button(this).apply { text = "Release all held keys" }
-        release.setOnClickListener { releaseAll() }
-        root.addView(release)
+        buildConnect(newPanel())
+        buildControl(newPanel())
+        buildNvda(newPanel())
+        buildVoice(newPanel())
+        buildMacros(newPanel())
+        buildSettings(newPanel())
+        showTab(1)
         updateUi()
+
+        if (prefs.getBoolean("auto", false) && !Remote.active) connectLast()
+        handleIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(i: Intent?) {
+        if (i?.getBooleanExtra("connect_last", false) == true) {
+            i.removeExtra("connect_last")
+            if (!Remote.active) connectLast()
+            ui.postDelayed({ moveTaskToBack(true) }, 500)
+        }
     }
 
     override fun onResume() {
@@ -153,27 +170,199 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    // ---------- common helpers ----------
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
+    private fun label(t: String) = TextView(this).apply { text = t; textSize = 16f; setPadding(0, dp(12), 0, dp(4)) }
+    private fun field(hint: String, value: String, numeric: Boolean = false) = EditText(this).apply {
+        this.hint = hint; setText(value); setSingleLine(); contentDescription = hint
+        if (numeric) inputType = InputType.TYPE_CLASS_NUMBER
+    }
+    private fun check(t: String, on: Boolean) = CheckBox(this).apply { text = t; isChecked = on }
+    private fun button(t: String, onClick: () -> Unit) = Button(this).apply {
+        text = t; isAllCaps = false; setOnClickListener { onClick() }
+    }
+    private fun newPanel(): LinearLayout {
+        val p = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(8), dp(8), dp(8)) }
+        content.addView(p); panels.add(p); return p
+    }
+    private fun showTab(i: Int) {
+        panels.forEachIndexed { idx, p -> p.visibility = if (idx == i) View.VISIBLE else View.GONE }
+        tabBtns.forEachIndexed { idx, tb -> tb.text = if (idx == i) "[" + tabNames[idx] + "]" else tabNames[idx] }
+    }
+    private fun row(vararg v: View) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        v.forEach { addView(it, LinearLayout.LayoutParams(0, dp(56), 1f)) }
+    }
+    private fun grid(p: LinearLayout, items: List<Pair<String, String>>, per: Int) {
+        var i = 0
+        while (i < items.size) {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for (j in i until minOf(i + per, items.size)) {
+                val (l, a) = items[j]
+                r.addView(button(l) { Voice.run(a, false) }.apply { textSize = 13f }, LinearLayout.LayoutParams(0, dp(56), 1f))
+            }
+            p.addView(r); i += per
+        }
+    }
+    private fun seekRow(p: LinearLayout, max: Int, progress: Int, fmt: (Int) -> String, onChange: (Int) -> Unit) {
+        val tv = TextView(this).apply { text = fmt(progress) }
+        val sb = SeekBar(this).apply { this.max = max; this.progress = progress }
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) { tv.text = fmt(v); onChange(v) }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        p.addView(tv); p.addView(sb)
+    }
+    private fun askText(title: String, hint: String, onOk: (String) -> Unit) {
+        val et = EditText(this); et.hint = hint
+        AlertDialog.Builder(this).setTitle(title).setView(et)
+            .setPositiveButton("Save") { _, _ -> val t = et.text.toString().trim(); if (t.isNotEmpty()) onOk(t) }
+            .setNegativeButton("Cancel", null).show()
+    }
     private fun updateUi() {
         connectBtn.text = if (Remote.active) "Disconnect" else "Connect"
-        form.visibility = if (Remote.active) View.GONE else View.VISIBLE
+        muteBtn.text = if (Remote.speak) "Mute speech" else "Unmute speech"
+        if (::speakBox.isInitialized && speakBox.isChecked != Remote.speak) speakBox.isChecked = Remote.speak
     }
-
     private fun showKeyboard() {
         capture.requestFocus()
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(capture, InputMethodManager.SHOW_IMPLICIT)
     }
 
-    // ---------- UI helpers ----------
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-    private fun label(t: String) = TextView(this).apply { text = t; textSize = 16f; setPadding(0, dp(12), 0, dp(4)) }
-    private fun row(vararg v: View) = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        v.forEach { addView(it, LinearLayout.LayoutParams(0, dp(56), 1f)) }
+    // ============ CONNECT TAB ============
+    private fun buildConnect(p: LinearLayout) {
+        profileSpinner = Spinner(this)
+        nameField = field("Profile name", "")
+        hostField = field("Server host", "")
+        portField = field("Port", "6837", true)
+        keyField = field("Key", "")
+        trustBox = check("Accept untrusted certificate", false)
+        val auto = check("Connect automatically when the app opens", prefs.getBoolean("auto", false))
+        auto.setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("auto", c).apply() }
+        p.addView(label("Saved connections"))
+        p.addView(profileSpinner)
+        listOf<View>(nameField, hostField, portField, keyField, trustBox, auto).forEach { p.addView(it) }
+        p.addView(row(
+            button("Save profile") { saveProfile() },
+            button("Delete profile") { deleteProfile() }))
+        p.addView(TextView(this).apply { text = "Pick a profile above, then press Connect at the top." })
+        profileSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                if (pos < profiles.size) {
+                    val pr = profiles[pos]
+                    nameField.setText(pr.name); hostField.setText(pr.host); portField.setText(pr.port.toString())
+                    keyField.setText(pr.key); trustBox.isChecked = pr.trust
+                    prefs.edit().putString("last", pr.name).apply()
+                }
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        refreshProfiles(prefs.getString("last", null))
     }
-    private fun key(l: String, vk: Int, ext: Boolean = false) = Button(this).apply {
-        text = l; contentDescription = l; isAllCaps = false; textSize = 12f
-        setOnClickListener { Remote.tap(vk, ext) }
+
+    private fun refreshProfiles(select: String?) {
+        profiles = Store.profiles(this)
+        val names = ArrayList<String>()
+        profiles.forEach { names.add(it.name) }
+        names.add("New profile")
+        profileSpinner.adapter = ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item, names)
+        val idx = if (select != null) profiles.indexOfFirst { it.name == select } else -1
+        profileSpinner.setSelection(if (idx >= 0) idx else names.size - 1)
     }
+
+    private fun saveProfile() {
+        val host = hostField.text.toString().trim()
+        val key = keyField.text.toString().trim()
+        if (host.isEmpty() || key.isEmpty()) { toast("Enter host and key first"); return }
+        var name = nameField.text.toString().trim()
+        if (name.isEmpty()) name = host
+        val port = portField.text.toString().toIntOrNull() ?: 6837
+        val list = Store.profiles(this).filter { it.name != name }.toMutableList()
+        list.add(Store.Profile(name, host, port, key, trustBox.isChecked))
+        Store.saveProfiles(this, list)
+        prefs.edit().putString("last", name).apply()
+        refreshProfiles(name)
+        toast("Saved \"$name\"")
+    }
+
+    private fun deleteProfile() {
+        val pos = profileSpinner.selectedItemPosition
+        if (pos < 0 || pos >= profiles.size) { toast("Select a saved profile first"); return }
+        val name = profiles[pos].name
+        Store.saveProfiles(this, Store.profiles(this).filter { it.name != name })
+        refreshProfiles(null)
+        toast("Deleted \"$name\"")
+    }
+
+    private fun connectFromFields() {
+        val h = hostField.text.toString().trim()
+        val k = keyField.text.toString().trim()
+        if (h.isEmpty() || k.isEmpty()) { status.text = "Enter host and key on the Connect tab"; showTab(0); return }
+        val name = nameField.text.toString().trim()
+        if (name.isNotEmpty()) prefs.edit().putString("last", name).apply()
+        Remote.start(this, h, portField.text.toString().toIntOrNull() ?: 6837, k, trustBox.isChecked)
+        updateUi()
+    }
+
+    private fun connectLast() {
+        val ps = Store.profiles(this)
+        val last = prefs.getString("last", null)
+        val pr = ps.firstOrNull { it.name == last } ?: ps.firstOrNull()
+        if (pr != null) { Remote.start(this, pr.host, pr.port, pr.key, pr.trust); updateUi() }
+        else if (hostField.text.isNotEmpty()) connectFromFields()
+    }
+
+    // ============ CONTROL TAB ============
+    private fun buildControl(p: LinearLayout) {
+        val pad = GesturePad(this)
+        p.addView(pad, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(300)))
+        seekRow(p, 160, prefs.getInt("dist", 60), { v -> "Gesture distance: ${40 + v} (higher = less sensitive)" },
+            { v -> distDp = 40 + v; prefs.edit().putInt("dist", v).apply() })
+        distDp = 40 + prefs.getInt("dist", 60)
+        tapsOn = prefs.getBoolean("taps", true)
+        val tapBox = check("Taps and hold on the pad", tapsOn)
+        tapBox.setOnCheckedChangeListener { _, c -> tapsOn = c; prefs.edit().putBoolean("taps", c).apply() }
+        p.addView(tapBox)
+        p.addView(button("Edit gestures (choose what each one does)") { editGestures() })
+
+        p.addView(label("Live keyboard (tap here to type)"))
+        capture = KeyCaptureView(this)
+        capture.setBackgroundColor(0xFFE0E0E0.toInt())
+        capture.contentDescription = "Live keyboard. Tap to open the keyboard. Everything you type goes straight to the PC."
+        capture.setOnClickListener { showKeyboard() }
+        p.addView(capture, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(80)))
+
+        p.addView(label("Modifier keys (toggle to hold)"))
+        p.addView(row(mod("Ctrl", 0x11), mod("Alt", 0x12), mod("Shift", 0x10), mod("Win", 0x5B, true), mod("NVDA/Insert", 0x2D, true)))
+        p.addView(label("Extra keys (hold a key to repeat it)"))
+        p.addView(row(holdKey("Esc", 0x1B), holdKey("Tab", 0x09), holdKey("Enter", 0x0D), holdKey("Space", 0x20), holdKey("Backspace", 0x08)))
+        p.addView(row(holdKey("Up", 0x26, true), holdKey("Down", 0x28, true), holdKey("Left", 0x25, true), holdKey("Right", 0x27, true)))
+        p.addView(row(holdKey("Home", 0x24, true), holdKey("End", 0x23, true), holdKey("Page up", 0x21, true), holdKey("Page down", 0x22, true)))
+        p.addView(row(holdKey("Delete", 0x2E, true), holdKey("Applications", 0x5D, true), holdKey("Caps lock", 0x14)))
+        for (r in 0 until 2) p.addView(row(*(1..6).map { holdKey("F${r * 6 + it}", 0x70 + r * 6 + it - 1) }.toTypedArray()))
+        p.addView(button("Send Ctrl+Alt+Delete") { Remote.sendJson(JSONObject().put("type", "send_SAS")) })
+        p.addView(button("Send phone clipboard to PC") {
+            toast(if (Remote.pushClipboard(this)) "Clipboard sent" else "Clipboard is empty or not connected")
+        })
+        p.addView(button("Release all held keys") { releaseAll() })
+    }
+
+    private fun holdKey(l: String, vk: Int, ext: Boolean = false): Button {
+        val b = Button(this)
+        b.text = l; b.contentDescription = l; b.isAllCaps = false; b.textSize = 12f
+        val rep = object : Runnable { override fun run() { Remote.sendKey(vk, ext, true); ui.postDelayed(this, 60) } }
+        b.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { v.isPressed = true; Remote.sendKey(vk, ext, true); ui.postDelayed(rep, 450) }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { v.isPressed = false; ui.removeCallbacks(rep); Remote.sendKey(vk, ext, false) }
+            }
+            true
+        }
+        return b
+    }
+
     private fun mod(l: String, vk: Int, ext: Boolean = false) = ToggleButton(this).apply {
         textOn = "$l held"; textOff = l; text = l; isAllCaps = false; textSize = 11f
         setOnCheckedChangeListener { _, on ->
@@ -181,19 +370,39 @@ class MainActivity : Activity() {
             Remote.sendKey(vk, ext, on)
         }
     }
+
     private fun releaseAll() {
         fun walk(v: View) {
             if (v is ToggleButton) v.isChecked = false
             else if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
         }
-        walk(findViewById<View>(android.R.id.content))
+        walk(content)
     }
 
-    // ---------- Gesture pad ----------
+    private fun editGestures() {
+        val lay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(8), dp(12), dp(8)) }
+        val fields = LinkedHashMap<String, EditText>()
+        for ((k, lb) in Store.gestureLabels) {
+            lay.addView(TextView(this).apply { text = lb })
+            val et = EditText(this).apply { setText(gMap[k] ?: ""); setSingleLine(); contentDescription = lb }
+            fields[k] = et; lay.addView(et)
+        }
+        AlertDialog.Builder(this).setTitle("Edit gestures")
+            .setView(ScrollView(this).apply { addView(lay) })
+            .setPositiveButton("Save") { _, _ ->
+                val m = LinkedHashMap<String, String>()
+                for ((k, et) in fields) m[k] = et.text.toString().trim()
+                gMap = m; Store.saveGestureMap(this, m)
+            }
+            .setNeutralButton("Reset") { _, _ -> gMap = LinkedHashMap(Store.gestureDefaults); Store.saveGestureMap(this, gMap) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    // ---------- gesture pad ----------
     inner class GesturePad(ctx: Context) : TextView(ctx) {
-        private var ax = 0f; private var ay = 0f      // anchor for repeat / swipe
-        private var sx = 0f; private var sy = 0f      // where the touch started
-        private var lx = 0f; private var ly = 0f      // last centroid (multi finger)
+        private var ax = 0f; private var ay = 0f
+        private var sx = 0f; private var sy = 0f
+        private var lx = 0f; private var ly = 0f
         private var maxP = 0
         private var moved = false
         private var drift = 0f
@@ -205,7 +414,8 @@ class MainActivity : Activity() {
             text = "GESTURE PAD\n\n" +
                 "1 finger: swipe = arrows (keep dragging to repeat)\ntap = Enter, hold = Escape\n\n" +
                 "2 fingers: swipe right/left = Tab / Shift+Tab\nswipe up/down = Page Up / Page Down\ntap = Space\n\n" +
-                "3 fingers: swipe up/down = Home / End\nswipe left/right = Backspace / Delete\ntap = Alt+Tab"
+                "3 fingers: swipe up/down = Home / End\nswipe left/right = Backspace / Delete\ntap = Alt+Tab\n\n" +
+                "(You can change all of these with Edit gestures.)"
             textSize = 14f
             gravity = Gravity.CENTER
             setBackgroundColor(0xFFCFE8FF.toInt())
@@ -261,38 +471,340 @@ class MainActivity : Activity() {
         private fun fire(n: Int, d: Char) {
             val now = SystemClock.uptimeMillis()
             if (d == 'T' || d == 'H' || n > 1) {
-                if (now - lastFire < 400) return     // debounce
+                if (now - lastFire < 400) return
                 lastFire = now
             }
+            val action = gMap["$n$d"] ?: return
+            if (action.isEmpty()) return
             performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-            when (n) {
-                1 -> when (d) {
-                    'U' -> Remote.tap(0x26, true)
-                    'D' -> Remote.tap(0x28, true)
-                    'L' -> Remote.tap(0x25, true)
-                    'R' -> Remote.tap(0x27, true)
-                    'T' -> Remote.tap(0x0D)
-                    'H' -> Remote.tap(0x1B)
-                }
-                2 -> when (d) {
-                    'R' -> Remote.tap(0x09)
-                    'L' -> Remote.combo(0x10, 0x09)
-                    'U' -> Remote.tap(0x21, true)
-                    'D' -> Remote.tap(0x22, true)
-                    'T' -> Remote.tap(0x20)
-                }
-                3 -> when (d) {
-                    'U' -> Remote.tap(0x24, true)
-                    'D' -> Remote.tap(0x23, true)
-                    'L' -> Remote.tap(0x08)
-                    'R' -> Remote.tap(0x2E, true)
-                    'T' -> Remote.combo(0x12, 0x09)
-                }
-            }
+            Voice.run(action, false)
         }
     }
 
-    // ---------- Live keyboard capture ----------
+    // ============ NVDA TAB ============
+    private fun nvdaKey(shift: Boolean, vk: Int, ext: Boolean) {
+        Remote.sendKey(0x2D, true, true)
+        if (shift) Remote.sendKey(0x10, false, true)
+        Remote.tap(vk, ext)
+        if (shift) Remote.sendKey(0x10, false, false)
+        Remote.sendKey(0x2D, true, false)
+    }
+
+    private fun buildNvda(p: LinearLayout) {
+        p.addView(label("NVDA commands (laptop and desktop layouts share these)"))
+        grid(p, listOf("Say all" to "say all", "Read line" to "read line", "Read title" to "read title",
+            "Where am I" to "where am i", "NVDA menu" to "nvda menu", "Speech mode" to "speech mode",
+            "Stop speech" to "stop speech", "Pause speech" to "pause speech", "Elements list" to "elements list",
+            "NVDA settings" to "nvda settings"), 2)
+
+        p.addView(label("Browse mode navigation"))
+        val prev = ToggleButton(this).apply { textOn = "Going backwards"; textOff = "Going forwards"; text = "Going forwards"; isAllCaps = false }
+        p.addView(prev)
+        val keys = listOf("Heading" to 0x48, "Link" to 0x4B, "Button" to 0x42, "Table" to 0x54, "Landmark" to 0x44,
+            "Form field" to 0x46, "Edit field" to 0x45, "List" to 0x4C, "Graphic" to 0x47,
+            "Heading 1" to 0x31, "Heading 2" to 0x32, "Heading 3" to 0x33)
+        var i = 0
+        while (i < keys.size) {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for (j in i until minOf(i + 3, keys.size)) {
+                val (l, vk) = keys[j]
+                r.addView(button(l) { if (prev.isChecked) Remote.combo(0x10, vk) else Remote.tap(vk) }.apply { textSize = 13f },
+                    LinearLayout.LayoutParams(0, dp(56), 1f))
+            }
+            p.addView(r); i += 3
+        }
+
+        p.addView(label("Object navigation (the closest thing to a mouse)"))
+        val desktop = check("Desktop layout (numpad keys). Unchecked = laptop layout", false)
+        p.addView(desktop)
+        p.addView(row(
+            button("Parent") { if (desktop.isChecked) nvdaKey(false, 0x26, false) else nvdaKey(true, 0x26, true) },
+            button("Child") { if (desktop.isChecked) nvdaKey(false, 0x28, false) else nvdaKey(true, 0x28, true) }))
+        p.addView(row(
+            button("Previous") { if (desktop.isChecked) nvdaKey(false, 0x25, false) else nvdaKey(true, 0x25, true) },
+            button("Next") { if (desktop.isChecked) nvdaKey(false, 0x27, false) else nvdaKey(true, 0x27, true) }))
+        p.addView(row(
+            button("Activate") { if (desktop.isChecked) nvdaKey(false, 0x0D, true) else nvdaKey(false, 0x0D, false) },
+            button("Report") { if (desktop.isChecked) nvdaKey(false, 0x0C, false) else nvdaKey(true, 0x4F, false) }))
+
+        p.addView(label("Windows shortcuts"))
+        grid(p, listOf("Start menu" to "start menu", "Switch window" to "switch window", "Close window" to "close window",
+            "Show desktop" to "show desktop", "Run dialog" to "run dialog", "File explorer" to "file explorer",
+            "Task manager" to "task manager", "Lock screen" to "lock screen", "Select all" to "select all",
+            "Copy" to "copy", "Paste" to "paste", "Undo" to "undo"), 3)
+    }
+
+    // ============ VOICE TAB ============
+    private fun recLang() = when (Voice.lang) { "fr" -> "fr-FR"; "ar" -> "ar-TN"; else -> "en-US" }
+
+    private fun buildVoice(p: LinearLayout) {
+        voiceBtn = button("Start voice commands") {
+            if (voiceOn) stopVoice() else { voiceOn = true; voiceBtn.text = "Stop voice commands"; startVoice() }
+        }
+        voiceStatus = TextView(this).apply { text = "Voice: off" }
+        p.addView(voiceBtn); p.addView(voiceStatus)
+
+        p.addView(label("Voice language"))
+        val langs = listOf("English" to "en", "Français" to "fr", "العربية" to "ar")
+        val sp = Spinner(this)
+        sp.adapter = ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item, langs.map { it.first })
+        sp.setSelection(maxOf(0, langs.indexOfFirst { it.second == Voice.lang }))
+        sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                Voice.lang = langs[pos].second
+                prefs.edit().putString("vlang", Voice.lang).apply()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        p.addView(sp)
+
+        wakeBox = check("Only react after a wake word", prefs.getBoolean("wakeOn", false))
+        wakeBox.setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("wakeOn", c).apply() }
+        wakeField = field("Wake word", prefs.getString("wake", "computer") ?: "computer")
+        wakeField.setOnFocusChangeListener { _, _ -> prefs.edit().putString("wake", wakeField.text.toString()).apply() }
+        p.addView(wakeBox); p.addView(wakeField)
+
+        dictBtn = button("Start dictation (everything you say is typed)") { setDictation(!dictationOn) }
+        p.addView(dictBtn)
+
+        p.addView(label("What you can say"))
+        p.addView(TextView(this).apply {
+            text = "Keys: enter, tab, escape, space, backspace, delete, up, down, left, right, home, end, page up, page down, f 1 to f 12, numpad 5, comma, period, slash...\n" +
+                "Repeat: \"down 5\".\n" +
+                "Combinations: \"control shift escape\", \"alt f4\", \"NVDA n\", \"NVDA plus s\", \"insert space\".\n" +
+                "Letters after a modifier: say the letter or use alpha, bravo, charlie...\n" +
+                "Shortcuts: select all, copy, paste, undo, save, find, new tab, close window, switch window, start menu, show desktop, task manager.\n" +
+                "NVDA: say all, read line, read title, where am I, nvda menu, speech mode, stop speech, pause speech, elements list.\n" +
+                "Browse mode: next heading, previous heading, next link, next button, next table, next landmark, next form field.\n" +
+                "Text: \"type hello world\".\n" +
+                "Clipboard: \"push clipboard\".\n" +
+                "Control: \"start dictation\", \"stop dictation\", \"stop listening\".\n" +
+                "Your own phrases from the Macros tab work too."
+        })
+
+        p.addView(label("Feedback"))
+        vibrateBox = check("Vibrate when a command is understood or not", prefs.getBoolean("vib", true))
+        vibrateBox.setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("vib", c).apply() }
+        speakResultBox = check("Say \"done\" or \"not understood\" on the phone", prefs.getBoolean("sayres", false))
+        speakResultBox.setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("sayres", c).apply() }
+        p.addView(vibrateBox); p.addView(speakResultBox)
+    }
+
+    private fun feedback(ok: Boolean) {
+        if (vibrateBox.isChecked) Remote.vibrate(if (ok) 40 else 150)
+        if (speakResultBox.isChecked) Remote.say(if (ok) "Done" else "Not understood")
+    }
+
+    private fun setDictation(on: Boolean) {
+        dictationOn = on
+        dictBtn.text = if (on) "Stop dictation" else "Start dictation (everything you say is typed)"
+        voiceStatus.text = if (on) "Voice: dictation on (say stop dictation to end)" else "Voice: listening..."
+        if (on && !voiceOn) { voiceOn = true; voiceBtn.text = "Stop voice commands"; startVoice() }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 2) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) startVoice()
+            else { voiceStatus.text = "Voice: microphone permission denied"; stopVoice() }
+        }
+    }
+
+    private fun stopVoice() {
+        voiceOn = false
+        dictationOn = false
+        try { recognizer?.cancel() } catch (_: Exception) {}
+        if (::voiceBtn.isInitialized) voiceBtn.text = "Start voice commands"
+        if (::dictBtn.isInitialized) dictBtn.text = "Start dictation (everything you say is typed)"
+        if (::voiceStatus.isInitialized) voiceStatus.text = "Voice: off"
+    }
+
+    private fun startVoice() {
+        if (!voiceOn) return
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 2); return
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            voiceStatus.text = "Voice: speech recognition not available on this phone"; stopVoice(); return
+        }
+        if (recognizer == null) {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            recognizer!!.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(p: Bundle?) { if (!dictationOn) voiceStatus.text = "Voice: listening..." }
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(v: Float) {}
+                override fun onBufferReceived(b: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+                override fun onPartialResults(b: Bundle?) {}
+                override fun onEvent(t: Int, b: Bundle?) {}
+                override fun onError(error: Int) {
+                    if (!voiceOn) return
+                    if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) { stopVoice(); return }
+                    ui.postDelayed({ startVoice() }, 600)
+                }
+                override fun onResults(results: Bundle?) {
+                    val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    if (list != null && list.isNotEmpty()) handleVoice(list)
+                    if (voiceOn) ui.postDelayed({ startVoice() }, 300)
+                }
+            })
+        }
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, recLang())
+            .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+        recognizer!!.startListening(i)
+    }
+
+    private fun handleVoice(list: List<String>) {
+        val low = list.map { it.lowercase() }
+        if (low.any { it.contains("stop listening") }) { stopVoice(); return }
+        if (dictationOn) {
+            if (low.any { it.contains("stop dictation") }) { setDictation(false); feedback(true); return }
+            Remote.sendText(list[0] + " ")
+            voiceStatus.text = "Dictated: ${list[0]}"
+            return
+        }
+        var cands = list
+        if (wakeBox.isChecked) {
+            val w = wakeField.text.toString().trim().lowercase()
+            if (w.isNotEmpty()) {
+                cands = list.filter { it.lowercase().startsWith(w) }.map { it.substring(w.length).trimStart(',', ' ', '.') }
+                if (cands.isEmpty()) return
+            }
+        }
+        if (cands.any { it.lowercase().contains("start dictation") }) { setDictation(true); feedback(true); return }
+        for (h in cands) {
+            if (Voice.run(h, true)) { voiceStatus.text = "Heard: $h"; feedback(true); return }
+        }
+        voiceStatus.text = "Heard: ${cands[0]} (not a command)"
+        feedback(false)
+    }
+
+    // ============ MACROS TAB ============
+    private fun buildMacros(p: LinearLayout) {
+        p.addView(label("Record a macro"))
+        p.addView(TextView(this).apply { text = "Press Start, use any control (gestures, keys, voice), press Stop, then give it a name. You can say the name to replay it." })
+        recordBtn = button("Start recording") { toggleRecording() }
+        p.addView(recordBtn)
+
+        p.addView(label("Add a voice shortcut"))
+        val phrase = field("What you say (e.g. open notepad)", "")
+        val action = field("What it does (e.g. windows r; type notepad; enter)", "")
+        p.addView(phrase); p.addView(action)
+        p.addView(TextView(this).apply { text = "Steps are separated by semicolons. Each step uses the same words as voice commands." })
+        p.addView(button("Save shortcut") {
+            val ph = phrase.text.toString().trim()
+            val ac = action.text.toString().trim()
+            if (ph.isEmpty() || ac.isEmpty()) { toast("Fill both fields"); return@button }
+            saveMacro(Store.Macro(ph, ph.lowercase(), "voice", ac))
+            phrase.setText(""); action.setText("")
+        })
+
+        p.addView(label("Saved macros and shortcuts (tap to run)"))
+        macroList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        p.addView(macroList)
+        refreshMacros()
+    }
+
+    private fun saveMacro(m: Store.Macro) {
+        val l = Store.macros(this).filter { it.name != m.name }.toMutableList()
+        l.add(m)
+        Store.saveMacros(this, l)
+        Voice.reload()
+        refreshMacros()
+        toast("Saved \"${m.name}\"")
+    }
+
+    private fun toggleRecording() {
+        val r = Remote.recording
+        if (r == null) {
+            Remote.recording = mutableListOf()
+            recordBtn.text = "Stop recording"
+            toast("Recording started")
+        } else {
+            Remote.recording = null
+            recordBtn.text = "Start recording"
+            val data = synchronized(r) { r.joinToString(";") }
+            if (r.isEmpty()) toast("Nothing was recorded")
+            else askText("Name this macro", "Name (also what you say)") { n -> saveMacro(Store.Macro(n, n.lowercase(), "raw", data)) }
+        }
+    }
+
+    private fun refreshMacros() {
+        macroList.removeAllViews()
+        val ms = Store.macros(this)
+        if (ms.isEmpty()) macroList.addView(TextView(this).apply { text = "No macros yet." })
+        for (m in ms) {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            r.addView(button("${m.name}  (say: ${m.phrase})") { Voice.runMacro(m) }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            r.addView(button("Delete") {
+                Store.saveMacros(this, Store.macros(this).filter { it.name != m.name })
+                Voice.reload(); refreshMacros()
+            })
+            macroList.addView(r)
+        }
+    }
+
+    // ============ SETTINGS TAB ============
+    private fun buildSettings(p: LinearLayout) {
+        p.addView(label("Speech from the PC"))
+        speakBox = check("Speak remote speech on this phone", Remote.speak)
+        speakBox.setOnCheckedChangeListener { _, c -> if (c != Remote.speak) Remote.setSpeak(c); updateUi() }
+        p.addView(speakBox)
+        seekRow(p, 30, ((Remote.ttsRate - 0.5f) / 0.05f).toInt(), { v -> "Speech speed: %.2f".format(0.5f + v * 0.05f) },
+            { v -> Remote.ttsRate = 0.5f + v * 0.05f; Remote.applyTts(); prefs.edit().putFloat("rate", Remote.ttsRate).apply() })
+        seekRow(p, 30, ((Remote.ttsPitch - 0.5f) / 0.05f).toInt(), { v -> "Speech pitch: %.2f".format(0.5f + v * 0.05f) },
+            { v -> Remote.ttsPitch = 0.5f + v * 0.05f; Remote.applyTts(); prefs.edit().putFloat("pitch", Remote.ttsPitch).apply() })
+        p.addView(button("Choose the speech voice and engine (Android settings)") {
+            try { startActivity(Intent("com.android.settings.TTS_SETTINGS")) } catch (_: Exception) { toast("Could not open settings") }
+        })
+        val shake = check("Shake the phone to mute or unmute speech (applies next time you connect)", prefs.getBoolean("shake", true))
+        shake.setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean("shake", c).apply() }
+        p.addView(shake)
+
+        p.addView(label("Controls"))
+        volumeBox = check("Volume keys act as Up and Down arrows", false)
+        p.addView(volumeBox)
+
+        p.addView(label("Background"))
+        p.addView(button("Battery settings (set this app to Unrestricted)") {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        })
+
+        p.addView(label("Updates"))
+        p.addView(TextView(this).apply { text = "Installed build: ${currentBuild()}" })
+        p.addView(button("Check for updates") { checkUpdate() })
+        p.addView(TextView(this).apply { text = "Quick tile: swipe down the Android quick settings, edit tiles, and add \"NVDA Pocket\" for one-tap connect." })
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentBuild(): Int = try { packageManager.getPackageInfo(packageName, 0).versionCode } catch (_: Exception) { 0 }
+
+    private fun checkUpdate() {
+        toast("Checking for updates...")
+        Thread {
+            try {
+                val c = URL("https://api.github.com/repos/mahmoud123456cm/NVDA_remote/releases/latest").openConnection() as HttpURLConnection
+                c.setRequestProperty("Accept", "application/vnd.github+json")
+                c.connectTimeout = 10000; c.readTimeout = 10000
+                val j = JSONObject(c.inputStream.bufferedReader().readText())
+                val n = j.getString("tag_name").removePrefix("build-").toIntOrNull() ?: 0
+                val assets = j.optJSONArray("assets")
+                val dl = if (assets != null && assets.length() > 0) assets.getJSONObject(0).getString("browser_download_url") else j.getString("html_url")
+                ui.post {
+                    if (n > currentBuild()) {
+                        toast("New build $n found. Opening the download...")
+                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(dl)))
+                    } else toast("You are up to date (build ${currentBuild()})")
+                }
+            } catch (e: Exception) {
+                ui.post { toast("Update check failed: ${e.message}") }
+            }
+        }.start()
+    }
+
+    // ============ LIVE KEYBOARD CAPTURE ============
     private fun keyToVk(code: Int): Pair<Int, Boolean>? {
         return when (code) {
             in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z -> Pair(0x41 + (code - KeyEvent.KEYCODE_A), false)
@@ -390,240 +902,17 @@ class MainActivity : Activity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (volumeBox.isChecked && Remote.connected) {
+        if (::volumeBox.isInitialized && volumeBox.isChecked && Remote.connected) {
             if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) { Remote.sendKey(0x26, true, true); return true }
             if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) { Remote.sendKey(0x28, true, true); return true }
         }
         return super.onKeyDown(keyCode, event)
     }
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (volumeBox.isChecked && Remote.connected) {
+        if (::volumeBox.isInitialized && volumeBox.isChecked && Remote.connected) {
             if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) { Remote.sendKey(0x26, true, false); return true }
             if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) { Remote.sendKey(0x28, true, false); return true }
         }
         return super.onKeyUp(keyCode, event)
-    }
-
-    // ---------- Voice commands (Android built-in recognizer, free) ----------
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 2) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) startVoice()
-            else { voiceStatus.text = "Voice: microphone permission denied"; stopVoice() }
-        }
-    }
-
-    private fun stopVoice() {
-        voiceOn = false
-        try { recognizer?.cancel() } catch (_: Exception) {}
-        if (::voiceBtn.isInitialized) voiceBtn.text = "Start voice commands"
-        if (::voiceStatus.isInitialized) voiceStatus.text = "Voice: off"
-    }
-
-    private fun startVoice() {
-        if (!voiceOn) return
-        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 2); return
-        }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            voiceStatus.text = "Voice: speech recognition not available on this phone"; stopVoice(); return
-        }
-        if (recognizer == null) {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this)
-            recognizer!!.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(p: Bundle?) { voiceStatus.text = "Voice: listening..." }
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(v: Float) {}
-                override fun onBufferReceived(b: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-                override fun onPartialResults(b: Bundle?) {}
-                override fun onEvent(t: Int, b: Bundle?) {}
-                override fun onError(error: Int) {
-                    if (!voiceOn) return
-                    if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) { stopVoice(); return }
-                    ui.postDelayed({ startVoice() }, 600)
-                }
-                override fun onResults(results: Bundle?) {
-                    val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    if (list != null && list.isNotEmpty()) {
-                        if (list.any { it.lowercase().contains("stop listening") }) { stopVoice(); return }
-                        var done = false
-                        for (h in list) {
-                            val acts = parseVoice(h)
-                            if (acts.isNotEmpty()) { voiceStatus.text = "Heard: $h"; execute(acts); done = true; break }
-                        }
-                        if (!done) voiceStatus.text = "Heard: ${list[0]} (not a command)"
-                    }
-                    if (voiceOn) ui.postDelayed({ startVoice() }, 300)
-                }
-            })
-        }
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
-            .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-        recognizer!!.startListening(i)
-    }
-
-    private val numWords = mapOf("zero" to 0, "one" to 1, "two" to 2, "three" to 3, "four" to 4, "five" to 5,
-        "six" to 6, "seven" to 7, "eight" to 8, "nine" to 9, "ten" to 10, "eleven" to 11, "twelve" to 12)
-    private val homoWords = mapOf("to" to 2, "too" to 2, "for" to 4)
-
-    private fun buildKeyWords(): Map<String, Pair<Int, Boolean>> {
-        val m = HashMap<String, Pair<Int, Boolean>>()
-        fun k(vk: Int, ext: Boolean, vararg names: String) { for (n in names) m[n] = Pair(vk, ext) }
-        k(0x0D, false, "enter", "return")
-        k(0x09, false, "tab")
-        k(0x1B, false, "escape", "esc")
-        k(0x20, false, "space", "spacebar")
-        k(0x08, false, "backspace")
-        k(0x2E, true, "delete", "del")
-        k(0x26, true, "up"); k(0x28, true, "down"); k(0x25, true, "left"); k(0x27, true, "right")
-        k(0x24, true, "home"); k(0x23, true, "end")
-        k(0x21, true, "pageup"); k(0x22, true, "pagedown")
-        k(0x2D, true, "ins")
-        k(0x14, false, "capslock")
-        k(0x5D, true, "menu", "applications")
-        k(0x2C, true, "printscreen")
-        k(0x91, false, "scrolllock")
-        k(0x13, false, "pause", "break")
-        k(0x90, true, "numlock")
-        k(0xBD, false, "minus", "dash", "hyphen")
-        k(0xBB, false, "equals", "equal")
-        k(0xDB, false, "openbracket")
-        k(0xDD, false, "closebracket")
-        k(0xDC, false, "backslash")
-        k(0xBA, false, "semicolon")
-        k(0xDE, false, "quote", "apostrophe")
-        k(0xBC, false, "comma")
-        k(0xBE, false, "period", "dot")
-        k(0xBF, false, "slash")
-        k(0xC0, false, "backtick", "grave", "tilde")
-        val dw = listOf("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
-        for (d in 0..9) { m["numpad$d"] = Pair(0x60 + d, false); m["numpad" + dw[d]] = Pair(0x60 + d, false) }
-        k(0x6B, false, "numpadplus", "numpadadd")
-        k(0x6D, false, "numpadminus", "numpadsubtract")
-        k(0x6A, false, "numpadmultiply", "numpadstar")
-        k(0x6F, true, "numpaddivide", "numpadslash")
-        k(0x6E, false, "numpaddot", "numpaddecimal", "numpadperiod")
-        k(0x0D, true, "numpadenter")
-        return m
-    }
-    private val keyWords = buildKeyWords()
-
-    private val modWords = mapOf(
-        "control" to Pair(0x11, false), "ctrl" to Pair(0x11, false), "alt" to Pair(0x12, false),
-        "shift" to Pair(0x10, false),
-        "insert" to Pair(0x2D, true), "nvda" to Pair(0x2D, true), "nvidia" to Pair(0x2D, true),
-        "invidia" to Pair(0x2D, true), "envy" to Pair(0x2D, true),
-        "windows" to Pair(0x5B, true), "window" to Pair(0x5B, true), "win" to Pair(0x5B, true))
-
-    private val nato = mapOf("alpha" to 'a', "bravo" to 'b', "charlie" to 'c', "delta" to 'd', "echo" to 'e',
-        "foxtrot" to 'f', "golf" to 'g', "hotel" to 'h', "india" to 'i', "juliet" to 'j', "kilo" to 'k',
-        "lima" to 'l', "mike" to 'm', "november" to 'n', "oscar" to 'o', "papa" to 'p', "quebec" to 'q',
-        "romeo" to 'r', "sierra" to 's', "tango" to 't', "uniform" to 'u', "victor" to 'v', "whiskey" to 'w',
-        "xray" to 'x', "yankee" to 'y', "zulu" to 'z')
-
-    // Spoken forms the recognizer often produces for a letter; only used right after a modifier (NVDA, Ctrl, Alt...)
-    private val letterAlias = mapOf(
-        "be" to 'b', "bee" to 'b', "see" to 'c', "sea" to 'c', "dee" to 'd', "ee" to 'e', "eff" to 'f', "ef" to 'f',
-        "gee" to 'g', "aitch" to 'h', "eye" to 'i', "jay" to 'j', "kay" to 'k', "el" to 'l', "em" to 'm',
-        "en" to 'n', "in" to 'n', "and" to 'n', "an" to 'n', "oh" to 'o', "owe" to 'o', "pee" to 'p', "pea" to 'p',
-        "cue" to 'q', "queue" to 'q', "are" to 'r', "ess" to 's', "es" to 's', "tea" to 't', "tee" to 't',
-        "you" to 'u', "vee" to 'v', "dub" to 'w', "ex" to 'x', "why" to 'y', "zee" to 'z', "zed" to 'z')
-
-    private val norm = listOf(
-        "page up" to "pageup", "page down" to "pagedown", "caps lock" to "capslock", "back space" to "backspace",
-        "num lock" to "numlock", "scroll lock" to "scrolllock", "print screen" to "printscreen",
-        "forward slash" to "slash", "back slash" to "backslash", "open bracket" to "openbracket",
-        "left bracket" to "openbracket", "close bracket" to "closebracket", "right bracket" to "closebracket",
-        "windows key" to "windows", "context menu" to "menu", "double u" to "w", "n v d a" to "nvda",
-        "n.v.d.a" to "nvda")
-
-    // Spoken shortcuts. The right side is parsed again by the normal parser.
-    private val macros = listOf(
-        "select all" to "control a", "copy" to "control c", "cut" to "control x", "paste" to "control v",
-        "undo" to "control z", "redo" to "control y", "save" to "control s", "find" to "control f",
-        "new tab" to "control t", "close tab" to "control w", "close window" to "alt f4",
-        "switch window" to "alt tab", "next window" to "alt tab", "start menu" to "windows",
-        "show desktop" to "windows d", "lock screen" to "windows l", "run dialog" to "windows r",
-        "file explorer" to "windows e", "task manager" to "control shift escape", "refresh" to "f5",
-        "stop speech" to "control", "pause speech" to "shift",
-        "nvda menu" to "nvda n", "say all" to "nvda down", "read all" to "nvda down", "read line" to "nvda up",
-        "read title" to "nvda t", "where am i" to "nvda tab", "elements list" to "nvda f7",
-        "speech mode" to "nvda s", "nvda settings" to "nvda control g",
-        "next heading" to "h", "previous heading" to "shift h", "next link" to "k", "next button" to "b",
-        "next table" to "t", "next landmark" to "d", "next form field" to "f", "next edit field" to "e"
-    ).sortedByDescending { it.first.length }
-
-    private class Act(val mods: List<Pair<Int, Boolean>>, val key: Pair<Int, Boolean>?, val count: Int, val text: String? = null)
-
-    private fun numOf(t: String, loose: Boolean): Int? =
-        t.toIntOrNull() ?: numWords[t] ?: (if (loose) homoWords[t] else null)
-
-    /**
-     * Examples: "down 5", "NVDA n", "NVDA plus s", "control shift escape", "alt f four",
-     * "page down", "numpad plus", "select all", "say all", "type hello world".
-     */
-    private fun parseVoice(raw: String): List<Act> {
-        var s = raw.lowercase().trim()
-        for (p in listOf("type ", "write ", "dictate ", "text ")) {
-            if (s.startsWith(p)) return listOf(Act(emptyList(), null, 1, raw.trim().substring(p.length)))
-        }
-        s = " $s "
-        for ((k, v) in macros) s = Regex("\\b" + Regex.escape(k) + "\\b").replace(s, " $v ")
-        s = s.replace("+", " ").replace(",", " ").replace(".", " ").replace("-", " ")
-        for ((a, b) in norm) s = s.replace(a, b)
-        s = Regex("numpad\\s+(\\w+)").replace(s) { "numpad" + it.groupValues[1] }
-        s = Regex("\\bplus\\b").replace(s, " ")
-        s = s.replace("arrow", " ")
-        val skip = setOf("press", "hit", "key", "the", "times", "time", "then", "letter", "number")
-        val toks = s.trim().split(Regex("\\s+")).filter { it.isNotEmpty() && it !in skip }
-
-        val acts = mutableListOf<Act>()
-        val mods = mutableListOf<Pair<Int, Boolean>>()
-        var i = 0
-        while (i < toks.size) {
-            val t = toks[i]
-            val m = modWords[t]
-            if (m != null) { mods.add(m); i++; continue }
-            var k: Pair<Int, Boolean>? = null
-            var consumed = 1
-            val fm = Regex("^f(\\d{1,2})$").find(t)
-            val fnum = if (t == "f" && i + 1 < toks.size) numOf(toks[i + 1], false) else null
-            if (fm != null && fm.groupValues[1].toInt() in 1..12) {
-                k = Pair(0x70 + fm.groupValues[1].toInt() - 1, false)
-            } else if (fnum != null && fnum in 1..12) {
-                k = Pair(0x70 + fnum - 1, false); consumed = 2
-            } else {
-                k = keyWords[t]
-            }
-            if (k == null && t.length == 1 && t[0] in 'a'..'z') k = Pair(t[0].uppercaseChar().code, false)
-            if (k == null) { val c = nato[t]; if (c != null) k = Pair(c.uppercaseChar().code, false) }
-            if (k == null) { val n = numOf(t, false); if (n != null && n in 0..9) k = Pair(0x30 + n, false) }
-            if (k == null && mods.isNotEmpty()) { val c = letterAlias[t]; if (c != null) k = Pair(c.uppercaseChar().code, false) }
-            if (k == null) { i++; continue }
-            val kk: Pair<Int, Boolean> = k
-            i += consumed
-            var count = 1
-            if (mods.isEmpty() && i < toks.size) {
-                val n = numOf(toks[i], true)
-                if (n != null && n in 1..50) { count = n; i++ }
-            }
-            acts.add(Act(mods.toList(), kk, count))
-            mods.clear()
-        }
-        if (mods.isNotEmpty()) acts.add(Act(mods.toList(), null, 1))   // e.g. "NVDA" or "control" alone = tap that key
-        return acts
-    }
-
-    private fun execute(acts: List<Act>) {
-        for (a in acts) {
-            if (a.text != null) { Remote.sendText(a.text); continue }
-            a.mods.forEach { Remote.sendKey(it.first, it.second, true) }
-            val k = a.key
-            if (k != null) repeat(a.count) { Remote.tap(k.first, k.second) }
-            a.mods.reversed().forEach { Remote.sendKey(it.first, it.second, false) }
-        }
     }
 }
