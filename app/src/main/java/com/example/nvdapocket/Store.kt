@@ -10,18 +10,54 @@ object Store {
     /** kind = "voice": data is steps separated by ";" (same words as voice commands). kind = "raw": recorded key events. */
     class Macro(val name: String, val phrase: String, val kind: String, val data: String)
 
-    val gestureDefaults: LinkedHashMap<String, String> = linkedMapOf(
+    /** One gesture the pad can recognise. id is "<fingers><kind>", e.g. 2U (two fingers up), 3DT (three-finger double tap). */
+    class GestureInfo(val id: String, val label: String, val group: String)
+
+    /** Gestures that have an action out of the box. Everything else starts empty and the user decides what it does. */
+    private val builtInActions = mapOf(
         "1U" to "up", "1D" to "down", "1L" to "left", "1R" to "right", "1T" to "enter", "1H" to "escape",
         "2R" to "tab", "2L" to "shift tab", "2U" to "page up", "2D" to "page down", "2T" to "space",
         "3U" to "home", "3D" to "end", "3L" to "backspace", "3R" to "delete", "3T" to "alt tab")
 
-    val gestureLabels: LinkedHashMap<String, String> = linkedMapOf(
-        "1U" to "1 finger: swipe up", "1D" to "1 finger: swipe down", "1L" to "1 finger: swipe left",
-        "1R" to "1 finger: swipe right", "1T" to "1 finger: tap", "1H" to "1 finger: hold",
-        "2R" to "2 fingers: swipe right", "2L" to "2 fingers: swipe left", "2U" to "2 fingers: swipe up",
-        "2D" to "2 fingers: swipe down", "2T" to "2 fingers: tap",
-        "3U" to "3 fingers: swipe up", "3D" to "3 fingers: swipe down", "3L" to "3 fingers: swipe left",
-        "3R" to "3 fingers: swipe right", "3T" to "3 fingers: tap")
+    val gestures: List<GestureInfo> = buildGestures()
+
+    private fun buildGestures(): List<GestureInfo> {
+        val out = ArrayList<GestureInfo>()
+        for (n in 1..5) {
+            val g = if (n == 1) "1 finger" else "$n fingers"
+            out.add(GestureInfo("${n}U", "$g: swipe up", g))
+            out.add(GestureInfo("${n}D", "$g: swipe down", g))
+            out.add(GestureInfo("${n}L", "$g: swipe left", g))
+            out.add(GestureInfo("${n}R", "$g: swipe right", g))
+            out.add(GestureInfo("${n}T", "$g: tap", g))
+            out.add(GestureInfo("${n}DT", "$g: double tap", g))
+            out.add(GestureInfo("${n}TT", "$g: triple tap", g))
+            out.add(GestureInfo("${n}H", "$g: hold", g))
+            if (n >= 2) {
+                out.add(GestureInfo("${n}PI", "$g: pinch in", g))
+                out.add(GestureInfo("${n}PO", "$g: spread out", g))
+            }
+            if (n == 2) {
+                out.add(GestureInfo("2RC", "$g: rotate clockwise", g))
+                out.add(GestureInfo("2RA", "$g: rotate anticlockwise", g))
+            }
+            if (n == 1) {
+                out.add(GestureInfo("1EL", "$g: swipe in from the left edge", g))
+                out.add(GestureInfo("1ER", "$g: swipe in from the right edge", g))
+                out.add(GestureInfo("1ET", "$g: swipe in from the top edge", g))
+                out.add(GestureInfo("1EB", "$g: swipe in from the bottom edge", g))
+                out.add(GestureInfo("1CTL", "$g: tap the top-left corner", g))
+                out.add(GestureInfo("1CTR", "$g: tap the top-right corner", g))
+                out.add(GestureInfo("1CBL", "$g: tap the bottom-left corner", g))
+                out.add(GestureInfo("1CBR", "$g: tap the bottom-right corner", g))
+            }
+        }
+        return out
+    }
+
+    val gestureDefaults: LinkedHashMap<String, String> = LinkedHashMap<String, String>().also { m ->
+        for (g in gestures) m[g.id] = builtInActions[g.id] ?: ""
+    }
 
     fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("p", Context.MODE_PRIVATE)
 

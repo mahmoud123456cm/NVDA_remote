@@ -75,7 +75,9 @@ class RemoteService : Service() {
             nm.createNotificationChannel(NotificationChannel("remote", "Connection", NotificationManager.IMPORTANCE_LOW))
         }
         val n = notif(Remote.lastStatus)
-        if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        // Android 15 limits dataSync services to about 6 hours, so use specialUse where it exists (API 34+).
+        if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        else if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         else startForeground(1, n)
         Remote.serviceListener = { t -> nm.notify(1, notif(t)) }
         if (wl == null) {

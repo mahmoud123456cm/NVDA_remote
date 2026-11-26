@@ -1,11 +1,13 @@
 package com.example.nvdapocket
 
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.speech.tts.TextToSpeech
@@ -31,6 +33,11 @@ object Remote {
     @Volatile var peers = 0            // controlled PCs seen in the channel
     @Volatile var recording: MutableList<String>? = null
     @Volatile private var generation = 0
+    @Volatile var clipIn = true        // copy text the PC puts on its clipboard to this phone automatically
+    @Volatile var lastPcClip: String? = null
+    var clipListener: ((String) -> Unit)? = null
+    @Volatile private var lastSentClip: String? = null
+    private const val MAX_CLIP = 200_000
     var ttsRate = 1f
     var ttsPitch = 1f
     private var appCtx: Context? = null
@@ -63,6 +70,7 @@ object Remote {
     fun initTts(ctx: Context) {
         val app = ctx.applicationContext
         appCtx = app
+        clipIn = Store.prefs(app).getBoolean("clipIn", true)
         if (tts == null) tts = TextToSpeech(app) { st -> ttsReady = st == TextToSpeech.SUCCESS; if (ttsReady) applyTts() }
     }
 
@@ -96,7 +104,7 @@ object Remote {
                 try {
                     connectOnce(host, port, chan, trust)
                 } catch (e: Exception) {
-                    if (active && gen == generation) setStatus("Error: ${e.message}")
+                    if (active && gen == generation) { setStatus("Error: ${e.message}"); CrashLog.log("connect", e) }
                 }
                 connected = false
                 peers = 0
@@ -112,6 +120,7 @@ object Remote {
         generation++
         connected = false
         peers = 0
+        cancelCapture()
         closeSocket()
         ctx.applicationContext.stopService(Intent(ctx.applicationContext, RemoteService::class.java))
         tts?.stop()
@@ -156,7 +165,12 @@ object Remote {
                 val sb = StringBuilder()
                 for (i in 0 until seq.length()) (seq.opt(i) as? String)?.let { if (it.isNotBlank()) sb.append(it).append(' ') }
                 val t = sb.toString().trim()
+                if (t.isNotEmpty() && addToCapture(t)) return   // being captured as clipboard text: don't read it aloud
                 if (t.isNotEmpty() && speak && ttsReady) tts?.speak(t, TextToSpeech.QUEUE_ADD, null, null)
+            }
+            "set_clipboard_text" -> {
+                val t = m.optString("text", "")
+                if (t.isNotEmpty() && t != lastSentClip) ui.post { onPcClipboard(t, false) }
             }
             "cancel" -> if (ttsReady) tts?.stop()
             "channel_joined" -> {
@@ -184,6 +198,94 @@ object Remote {
         }
     }
 
+    // ---------- PC clipboard -> phone ----------
+    /** Puts text on the phone's clipboard. Must run on the main thread. */
+    fun copyToPhone(text: String): Boolean {
+        val c = appCtx ?: return false
+        return try {
+            val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("NVDA Pocket", text))
+            true
+        } catch (e: Exception) { CrashLog.log("clipboard", e); false }
+    }
+
+    /** Copies the last text received from the PC to the phone clipboard again. */
+    fun recopyLastPcClip(): Boolean {
+        val t = lastPcClip
+        if (t == null) { say("No clipboard text received from the PC yet"); vibrate(150); return false }
+        val ok = copyToPhone(t)
+        if (ok) { vibrate(40); say("Copied to the phone clipboard") } else vibrate(150)
+        return ok
+    }
+
+    /** explicit = the user asked for it, so it is copied even when automatic copying is switched off. */
+    private fun onPcClipboard(text: String, explicit: Boolean) {
+        if (text.length > MAX_CLIP) { vibrate(150); say("The PC clipboard text is too large to copy"); return }
+        lastPcClip = text
+        clipListener?.invoke(text)
+        if (explicit || clipIn) {
+            if (copyToPhone(text)) { vibrate(40); say("Copied from the PC, ${text.length} characters") } else vibrate(150)
+        } else {
+            vibrate(40); say("PC clipboard received. Not copied")
+        }
+    }
+
+    // Fallback that works with the stock NVDA Remote add-on, which does not send its clipboard to the controlling side:
+    // ask NVDA to read the clipboard aloud (NVDA+C) and collect the speech it sends us. The text is what NVDA
+    // speaks, so symbols and line breaks can differ a little from the original.
+    private val capLock = Any()
+    private var capture: StringBuilder? = null
+    private var captureLast = 0L
+    private var captureStart = 0L
+    @Volatile private var captureToken = 0
+
+    /** copySelectionFirst = press Ctrl+C on the PC first, so the current selection is what comes back. */
+    fun fetchPcClipboard(copySelectionFirst: Boolean) {
+        if (!connected) { vibrate(150); say("Not connected"); return }
+        val token = ++captureToken
+        if (copySelectionFirst) combo(0x11, 0x43)
+        ui.postDelayed({ beginCapture(token) }, if (copySelectionFirst) 350L else 0L)
+        say(if (copySelectionFirst) "Copying the selection" else "Getting the PC clipboard")
+    }
+
+    private fun beginCapture(token: Int) {
+        if (token != captureToken || !connected) return
+        synchronized(capLock) { capture = StringBuilder(); captureStart = SystemClock.uptimeMillis(); captureLast = 0L }
+        sendKey(0x2D, true, true); tap(0x43); sendKey(0x2D, true, false)   // NVDA+C
+        ui.postDelayed({ pollCapture(token) }, 400)
+    }
+
+    /** Called for every piece of PC speech. Returns true when the speech was taken as clipboard text. */
+    private fun addToCapture(t: String): Boolean = synchronized(capLock) {
+        val c = capture ?: return@synchronized false
+        if (c.isNotEmpty()) c.append(' ')
+        c.append(t)
+        captureLast = SystemClock.uptimeMillis()
+        true
+    }
+
+    private fun pollCapture(token: Int) {
+        if (token != captureToken) return
+        val now = SystemClock.uptimeMillis()
+        val (done, text) = synchronized(capLock) {
+            val c = capture
+            val got = c != null && c.isNotEmpty()
+            val finished = (got && now - captureLast > 1000) || now - captureStart > 15000
+            val result = if (finished) c?.toString()?.trim() else null
+            if (finished) capture = null
+            Pair(finished, result)
+        }
+        if (!done) { ui.postDelayed({ pollCapture(token) }, 300); return }
+        if (text.isNullOrEmpty()) { vibrate(150); say("Nothing came back from the PC"); return }
+        if (text.contains("no text on the clipboard", ignoreCase = true)) { vibrate(150); say("The PC clipboard has no text"); return }
+        onPcClipboard(text, true)
+    }
+
+    private fun cancelCapture() {
+        captureToken++
+        synchronized(capLock) { capture = null }
+    }
+
     // ---------- sending ----------
     fun sendJson(o: JSONObject) {
         if (!connected) return
@@ -203,6 +305,7 @@ object Remote {
         val clip = cm.primaryClip
         val t = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(ctx)?.toString() else null
         if (t.isNullOrEmpty()) { vibrate(150); return false }
+        lastSentClip = t
         sendJson(JSONObject().put("type", "set_clipboard_text").put("text", t))
         vibrate(40)
         return true
@@ -223,7 +326,7 @@ object Remote {
         return skipped
     }
 
-    fun pushText(t: String) { sendJson(JSONObject().put("type", "set_clipboard_text").put("text", t)) }
+    fun pushText(t: String) { lastSentClip = t; sendJson(JSONObject().put("type", "set_clipboard_text").put("text", t)) }
 
     /** mode: "clip" = PC clipboard only, "paste" = clipboard then Ctrl+V, anything else = type as keys. */
     fun deliver(mode: String, text: String): String {

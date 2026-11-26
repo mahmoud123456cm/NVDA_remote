@@ -3,6 +3,7 @@ package com.example.nvdapocket
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import org.json.JSONObject
 
 /** Turns spoken or typed command text into key presses. Also runs custom macros. */
 object Voice {
@@ -225,9 +226,13 @@ object Voice {
         for (m in macrosCache) {
             if (m.phrase.lowercase() == low || m.name.lowercase() == low) { runMacro(m); return true }
         }
-        if (low == "push clipboard" || low == "send clipboard") {
-            val c = app ?: return false
-            Remote.pushClipboard(c); return true
+        when (low) {
+            "push clipboard", "send clipboard" -> { val c = app ?: return false; Remote.pushClipboard(c); return true }
+            "get clipboard", "get pc clipboard", "pull clipboard" -> { Remote.fetchPcClipboard(false); return true }
+            "get selection", "copy selection" -> { Remote.fetchPcClipboard(true); return true }
+            "last clipboard", "copy last clipboard" -> { Remote.recopyLastPcClip(); return true }
+            "toggle mute", "mute speech", "unmute speech" -> { Remote.toggleMute(); return true }
+            "send sas", "control alt delete", "ctrl alt delete" -> { Remote.sendJson(JSONObject().put("type", "send_SAS")); return true }
         }
         val acts = parse(raw, fromVoice)
         if (acts.isEmpty()) return false
@@ -235,9 +240,22 @@ object Voice {
         return true
     }
 
-    fun runMacro(m: Store.Macro) {
+    /** Runs one line of commands. Steps separated by ";" run one after another with a short pause between them. */
+    fun runLine(raw: String, fromVoice: Boolean = false): Boolean {
+        val steps = raw.split(";").map { it.trim() }.filter { it.isNotEmpty() }
+        if (steps.isEmpty()) return false
+        if (steps.size == 1) return run(steps[0], fromVoice)
         var delay = 0L
+        for (st in steps) {
+            ui.postDelayed({ run(st, fromVoice) }, delay)
+            delay += 400
+        }
+        return true
+    }
+
+    fun runMacro(m: Store.Macro) {
         if (m.kind == "raw") {
+            var delay = 0L
             for (e in m.data.split(";")) {
                 val p = e.split(",")
                 if (p.size != 3) continue
@@ -248,12 +266,7 @@ object Voice {
                 delay += 30
             }
         } else {
-            for (seg in m.data.split(";")) {
-                val t = seg.trim()
-                if (t.isEmpty()) continue
-                ui.postDelayed({ run(t, false) }, delay)
-                delay += 400
-            }
+            runLine(m.data, false)
         }
     }
 }

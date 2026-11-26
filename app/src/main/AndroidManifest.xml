@@ -3,6 +3,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -11,6 +12,7 @@
         <intent><action android:name="android.speech.RecognitionService" /></intent>
     </queries>
     <application
+        android:name=".App"
         android:label="NVDA Pocket"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
@@ -36,10 +38,16 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+        <!-- dataSync is time-limited on Android 15 when targeting SDK 35, so on Android 14+ the
+             service runs as specialUse (a permanent connection to a relay server). -->
         <service
             android:name=".RemoteService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Persistent connection to an NVDA Remote relay server so the phone can control a PC and speak its output" />
+        </service>
         <service
             android:name=".ConnectTile"
             android:exported="true"
