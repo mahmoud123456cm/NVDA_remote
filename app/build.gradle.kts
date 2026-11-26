@@ -4,13 +4,13 @@ plugins {
 }
 android {
     namespace = "com.example.nvdapocket"
-    compileSdk = 34
+    compileSdk = 35
     defaultConfig {
         applicationId = "com.example.nvdapocket"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 35
         versionCode = (project.findProperty("verCode") as String?)?.toIntOrNull() ?: 1
-        versionName = "3.0"
+        versionName = "3.2"
     }
     signingConfigs {
         create("main") {

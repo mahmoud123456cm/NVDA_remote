@@ -3,6 +3,7 @@ package com.example.nvdapocket
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import org.json.JSONObject
 
 /** Turns spoken or typed command text into key presses. Also runs custom macros. */
 object Voice {
@@ -223,11 +224,15 @@ object Voice {
         val low = raw.trim().lowercase()
         if (low.isEmpty()) return false
         for (m in macrosCache) {
-            if (m.phrase.lowercase() == low || m.name.lowercase() == low) { runMacro(m); return true }
+            if (m.matches(low)) { runMacro(m); return true }
         }
-        if (low == "push clipboard" || low == "send clipboard") {
-            val c = app ?: return false
-            Remote.pushClipboard(c); return true
+        when (low) {
+            "push clipboard", "send clipboard" -> { val c = app ?: return false; Remote.pushClipboard(c); return true }
+            "get clipboard", "get pc clipboard", "pull clipboard" -> { Remote.fetchPcClipboard(false); return true }
+            "get selection", "copy selection" -> { Remote.fetchPcClipboard(true); return true }
+            "last clipboard", "copy last clipboard" -> { Remote.recopyLastPcClip(); return true }
+            "toggle mute", "mute speech", "unmute speech" -> { Remote.toggleMute(); return true }
+            "send sas", "control alt delete", "ctrl alt delete" -> { Remote.sendJson(JSONObject().put("type", "send_SAS")); return true }
         }
         val acts = parse(raw, fromVoice)
         if (acts.isEmpty()) return false
@@ -235,9 +240,107 @@ object Voice {
         return true
     }
 
-    fun runMacro(m: Store.Macro) {
+    private val waitRx = Regex("^(?:wait|pause)\\s+(\\d+(?:\\.\\d+)?)\\s*(ms|milliseconds?|s|secs?|seconds?)?$", RegexOption.IGNORE_CASE)
+
+    private fun waitMs(m: MatchResult): Long {
+        val n = m.groupValues[1].toDoubleOrNull() ?: 0.0
+        val unit = m.groupValues[2].lowercase()
+        return (if (unit.startsWith("m")) n else n * 1000.0).toLong().coerceIn(0L, 60_000L)
+    }
+
+    /**
+     * Runs one line of commands. Steps separated by ";" run one after another with [gap] milliseconds between them.
+     * A step like "wait 2" (seconds) or "wait 500 ms" adds an extra pause.
+     */
+    fun runLine(raw: String, fromVoice: Boolean = false, gap: Int = 400): Boolean {
+        val steps = raw.split(";").map { it.trim() }.filter { it.isNotEmpty() }
+        if (steps.isEmpty()) return false
+        if (steps.size == 1) return if (waitRx.matches(steps[0])) true else run(steps[0], fromVoice)
         var delay = 0L
+        for (st in steps) {
+            val w = waitRx.matchEntire(st)
+            if (w != null) { delay += waitMs(w); continue }
+            ui.postDelayed({ run(st, fromVoice) }, delay)
+            delay += gap
+        }
+        return true
+    }
+
+    /** Every phrase that already means something, so the macro editor can warn about clashes. */
+    fun builtinPhrases(): Set<String> {
+        val s = HashSet<String>()
+        macroList.forEach { s.add(it.first) }
+        s.addAll(listOf("push clipboard", "send clipboard", "get clipboard", "get pc clipboard", "pull clipboard",
+            "get selection", "copy selection", "last clipboard", "copy last clipboard", "toggle mute", "mute speech",
+            "unmute speech", "send sas", "control alt delete", "ctrl alt delete", "start dictation", "stop dictation",
+            "stop listening"))
+        return s
+    }
+
+    // ---------------- recorded macros -> readable steps ----------------
+    private val preferredKeyNames = listOf("enter", "tab", "escape", "space", "backspace", "delete", "up", "down", "left", "right",
+        "home", "end", "pageup", "pagedown", "ins", "capslock", "menu", "printscreen", "scrolllock", "pause", "numlock",
+        "minus", "equals", "openbracket", "closebracket", "backslash", "semicolon", "quote", "comma", "period", "slash",
+        "backtick", "numpad0", "numpad1", "numpad2", "numpad3", "numpad4", "numpad5", "numpad6", "numpad7", "numpad8",
+        "numpad9", "numpadplus", "numpadminus", "numpadmultiply", "numpaddivide", "numpaddot", "numpadenter")
+    private val keyNameOf: Map<Pair<Int, Boolean>, String> by lazy {
+        val m = HashMap<Pair<Int, Boolean>, String>()
+        for (n in preferredKeyNames) keyWords[n]?.let { if (!m.containsKey(it)) m[it] = n }
+        m
+    }
+
+    private fun modName(vk: Int, ext: Boolean): String? = when {
+        vk == 0x11 -> "control"; vk == 0x12 -> "alt"; vk == 0x10 -> "shift"
+        vk == 0x5B && ext -> "windows"; vk == 0x2D && ext -> "nvda"
+        else -> null
+    }
+
+    private fun keyName(vk: Int, ext: Boolean): String? = when (vk) {
+        in 0x41..0x5A -> ('a' + (vk - 0x41)).toString()
+        in 0x30..0x39 -> (vk - 0x30).toString()
+        in 0x70..0x7B -> "f" + (vk - 0x70 + 1)
+        else -> keyNameOf[Pair(vk, ext)]
+    }
+
+    /** Best-effort: turns recorded key events ("vk,ext,pressed;...") into steps. The timing between keys is lost. */
+    fun rawToSteps(data: String): List<String> {
+        val steps = ArrayList<String>()
+        val typed = StringBuilder()
+        fun flush() { if (typed.isNotEmpty()) { steps.add("type $typed"); typed.setLength(0) } }
+        val held = ArrayList<String>()      // modifier names currently down, in order
+        var usedWithKey = false
+        for (e in data.split(";")) {
+            val p = e.split(",")
+            if (p.size != 3) continue
+            val vk = p[0].toIntOrNull() ?: continue
+            val ext = p[1] == "1"
+            val down = p[2] == "1"
+            val mod = modName(vk, ext)
+            if (mod != null) {
+                if (down) { if (held.isEmpty()) usedWithKey = false; if (mod !in held) held.add(mod) }
+                else if (mod in held) {
+                    val snapshot = held.toList()
+                    held.remove(mod)
+                    if (held.isEmpty() && !usedWithKey) { flush(); steps.add(snapshot.joinToString(" ")) }
+                }
+                continue
+            }
+            if (!down) continue
+            val name = keyName(vk, ext) ?: continue
+            usedWithKey = true
+            val plainChar = name.length == 1 || name == "space"
+            if (held.isEmpty() && plainChar) { typed.append(if (name == "space") ' ' else name[0]); continue }
+            if (held == listOf("shift") && name.length == 1 && name[0].isLetter()) { typed.append(name[0].uppercaseChar()); continue }
+            flush()
+            steps.add((held + name).joinToString(" "))
+        }
+        flush()
+        return steps
+    }
+
+    fun runMacro(m: Store.Macro) {
         if (m.kind == "raw") {
+            var delay = 0L
             for (e in m.data.split(";")) {
                 val p = e.split(",")
                 if (p.size != 3) continue
@@ -248,12 +351,7 @@ object Voice {
                 delay += 30
             }
         } else {
-            for (seg in m.data.split(";")) {
-                val t = seg.trim()
-                if (t.isEmpty()) continue
-                ui.postDelayed({ run(t, false) }, delay)
-                delay += 400
-            }
+            runLine(m.data, false, m.gap)
         }
     }
 }
