@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -18,7 +19,9 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -47,6 +50,7 @@ object Remote {
     var ttsPitch = 1f
     private var appCtx: Context? = null
     private var socket: SSLSocket? = null
+    @Volatile private var pending: Socket? = null   // a socket still in TCP connect / TLS handshake, so stop() can cut it short
     private var writer: PrintWriter? = null
     private val sender = Executors.newSingleThreadExecutor()
     private val speaker = Executors.newSingleThreadExecutor()          // speech runs here so a slow engine can never stall reading from the server
@@ -64,7 +68,35 @@ object Remote {
     var lastStatus = "Not connected"
     var statusListener: ((String) -> Unit)? = null
     var serviceListener: ((String) -> Unit)? = null
-    val held = mutableSetOf<Int>()
+    val held = mutableSetOf<Int>()                       // modifier keys toggled on in the Control tab; always access under synchronized(held)
+    private val staleHeld = mutableSetOf<Int>()           // were held when the link dropped: released on the PC as soon as we are back
+    var heldListener: (() -> Unit)? = null               // lets the Control tab untick its toggles when keys are released
+
+    private fun isExtMod(vk: Int) = vk == 0x5B || vk == 0x2D    // Windows key and Insert/NVDA are "extended" keys
+
+    fun setHeld(vk: Int, on: Boolean) { synchronized(held) { if (on) held.add(vk) else held.remove(vk) } }
+    fun isHeld(vk: Int): Boolean = synchronized(held) { vk in held }
+
+    private fun rawKeyUp(vk: Int) =
+        sendJson(JSONObject().put("type", "key").put("vk_code", vk).put("extended", isExtMod(vk)).put("pressed", false))
+
+    /**
+     * Lets go of every toggled-on modifier. sendUps = tell the PC now (the link is up). When the link is down the keys are
+     * remembered and released on the PC right after the next connect, so Ctrl/Shift/Alt/Win/NVDA can never stay stuck there.
+     */
+    fun releaseHeld(sendUps: Boolean) {
+        val snap = synchronized(held) { val l = held.toList(); held.clear(); l }
+        if (snap.isEmpty()) return
+        if (sendUps && connected) snap.forEach { rawKeyUp(it) }
+        else synchronized(staleHeld) { staleHeld.addAll(snap) }
+        ConnLog.add("Released held keys (" + snap.joinToString(", ") { "0x" + Integer.toHexString(it) } + ")")
+        ui.post { heldListener?.invoke() }
+    }
+
+    private fun flushStale() {
+        val snap = synchronized(staleHeld) { val l = staleHeld.toList(); staleHeld.clear(); l }
+        if (snap.isNotEmpty()) { snap.forEach { rawKeyUp(it) }; ConnLog.add("Released keys that were left held before the connection dropped") }
+    }
 
     // reconnecting, keep-alive and network watching
     private val reconnectLock = Object()
@@ -158,6 +190,9 @@ object Remote {
         try { tts?.voices?.firstOrNull { it.name == name }?.let { tts?.setVoice(it) } } catch (e: Exception) { CrashLog.log("tts voice", e) }
     }
 
+    /** True while the phone is speaking the PC's text. */
+    fun ttsBusy(): Boolean = try { tts?.isSpeaking == true } catch (_: Exception) { false }
+
     fun applyTts() { tts?.setSpeechRate(ttsRate); tts?.setPitch(ttsPitch) }
 
     // ----- choosing the speech engine and voice (Settings tab) -----
@@ -222,7 +257,8 @@ object Remote {
     fun start(ctx: Context, host: String, port: Int, chan: String, trust: Boolean) {
         initTts(ctx)
         val app = ctx.applicationContext
-        closeSocket()
+        releaseHeld(true)
+        closeSocketDeferred()
         active = true
         peers = 0
         hadLoss = false
@@ -239,7 +275,7 @@ object Remote {
                 retryNow = false
                 var certProblem = false
                 try {
-                    connectOnce(host, port, chan, trust)
+                    connectOnce(host, port, chan, trust, gen)
                     lastError = null
                 } catch (e: Exception) {
                     if (active && gen == generation) {
@@ -251,10 +287,10 @@ object Remote {
                         }
                     }
                 }
+                if (!(active && gen == generation)) break     // a newer connection owns the shared state now: do not touch it
                 val wasUp = connected
                 connected = false
                 peers = 0
-                if (!(active && gen == generation)) break
                 if (certProblem) {
                     ConnLog.add("The server's certificate is different from the remembered one. Stopped.")
                     Cue.play("cert_changed")
@@ -262,13 +298,14 @@ object Remote {
                     break
                 }
                 if (wasUp) {
+                    releaseHeld(false)
                     hadLoss = true
                     attempts = 0
                     ConnLog.add("Connection lost after ${(SystemClock.elapsedRealtime() - connectedAt) / 1000} s" + (lastError?.let { " ($it)" } ?: ""))
                     Cue.play("connection_lost")
                 }
                 attempts++
-                val delaySec = if (attempts == 1) 1 else minOf(30, 2 shl minOf(attempts - 2, 4))   // 1, 2, 4, 8, 16, 30...
+                val delaySec = if (attempts == 1) 1 else minOf(15, 2 shl minOf(attempts - 2, 3))   // 1, 2, 4, 8, 15, 15... (each retry also tries another IP / network)
                 var left = delaySec
                 while (left > 0 && active && gen == generation && !retryNow) {
                     setStatus("Connection lost. Reconnecting in $left s (attempt $attempts)" + (lastError?.let { ": $it" } ?: ""))
@@ -284,13 +321,14 @@ object Remote {
 
     fun stop(ctx: Context) {
         val wasActive = active
+        releaseHeld(true)                 // while the link is still up
         active = false
         generation++
         connected = false
         peers = 0
         cancelCapture()
         unwatchNetwork(ctx.applicationContext)
-        closeSocket()
+        closeSocketDeferred()
         ctx.applicationContext.stopService(Intent(ctx.applicationContext, RemoteService::class.java))
         tts?.stop()
         setStatus("Disconnected")
@@ -319,7 +357,19 @@ object Remote {
         return false
     }
 
+    /** Closes the connection after everything already queued for sending (for example key releases) has gone out. */
+    private fun closeSocketDeferred() {
+        val s = socket
+        val pend = pending
+        socket = null
+        pending = null
+        try { pend?.close() } catch (_: Exception) {}
+        sender.execute { try { s?.close() } catch (_: Exception) {} }
+    }
+
     private fun closeSocket() {
+        try { pending?.close() } catch (_: Exception) {}
+        pending = null
         try { socket?.close() } catch (_: Exception) {}
         socket = null
     }
@@ -420,18 +470,99 @@ object Remote {
         return SSLContext.getInstance("TLS").apply { init(null, arrayOf(tm), SecureRandom()) }.socketFactory
     }
 
-    private fun connectOnce(host: String, port: Int, chan: String, trust: Boolean) {
+    private fun transportName(cm: ConnectivityManager?, n: Network?): String {
+        if (n == null || cm == null) return "default network"
+        val c = try { cm.getNetworkCapabilities(n) } catch (_: Exception) { null } ?: return "network"
+        return when {
+            c.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+            c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+            c.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "mobile data"
+            c.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+            else -> "network"
+        }
+    }
+
+    /** The default network first, then every other network that has internet, so a retry can leave a Wi-Fi that swallows the connection. */
+    private fun candidateNetworks(cm: ConnectivityManager?): List<Network?> {
+        if (cm == null) return listOf(null)
+        val first: Network? = currentNet ?: try { cm.activeNetwork } catch (_: Exception) { null }
+        val out = ArrayList<Network?>()
+        out.add(first)
+        try {
+            for (n in cm.allNetworks) {
+                if (n == first) continue
+                val c = cm.getNetworkCapabilities(n) ?: continue
+                if (c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) out.add(n)
+            }
+        } catch (e: Exception) { CrashLog.log("networks", e) }
+        return out
+    }
+
+    /**
+     * TCP connect + TLS handshake with short time limits. Tries the addresses of the host one by one (IPv4 and IPv6),
+     * and on every failed round starts on the next network, because the log showed hours of "connected, then the
+     * handshake never answered" on one network while another network worked at once.
+     */
+    private fun openSecure(host: String, port: Int, trust: Boolean, gen: Int, attempt: Int): SSLSocket {
+        val cm = appCtx?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val nets = candidateNetworks(cm)
+        val net = nets[attempt % nets.size]
+        val netName = transportName(cm, net)
+        val all = try { (if (net != null) net.getAllByName(host) else InetAddress.getAllByName(host)).toList() }
+                  catch (e: Exception) { throw java.io.IOException("Cannot find $host on $netName (${e.message})", e) }
+        // IPv4 and IPv6 alternate so one broken family can never block every try
+        val v4 = all.filter { it is java.net.Inet4Address }
+        val v6 = all.filter { it !is java.net.Inet4Address }
+        val ordered = ArrayList<InetAddress>()
+        for (i in 0 until maxOf(v4.size, v6.size)) { v4.getOrNull(i)?.let { ordered.add(it) }; v6.getOrNull(i)?.let { ordered.add(it) } }
+        val start = (attempt / nets.size) % ordered.size
+        val factory: SSLSocketFactory = if (trust) pinningFactory(host, port) else SSLSocketFactory.getDefault() as SSLSocketFactory
+        val began = SystemClock.elapsedRealtime()
+        var last: Exception? = null
+        for (k in 0 until minOf(3, ordered.size)) {
+            if (!(active && gen == generation)) throw java.io.IOException("Cancelled")
+            if (k > 0 && SystemClock.elapsedRealtime() - began > 20_000) break
+            val addr = ordered[(start + k) % ordered.size]
+            val raw: Socket = net?.socketFactory?.createSocket() ?: Socket()
+            if (!(active && gen == generation)) { try { raw.close() } catch (_: Exception) {}; throw java.io.IOException("Cancelled") }
+            pending = raw
+            try {
+                raw.keepAlive = true
+                raw.tcpNoDelay = true
+                raw.connect(InetSocketAddress(addr, port), 6000)
+                val tcpMs = SystemClock.elapsedRealtime() - began
+                raw.soTimeout = 8000                        // the TLS handshake must answer within 8 s
+                val s = factory.createSocket(raw, host, port, true) as SSLSocket
+                if (!trust) {                               // verify the certificate is really for this host (not done by default on a bare SSLSocket)
+                    val ps = s.sslParameters
+                    ps.endpointIdentificationAlgorithm = "HTTPS"
+                    s.sslParameters = ps
+                }
+                s.startHandshake()
+                s.soTimeout = 0                             // reads may block for as long as the link is quiet
+                if (attempt > 0 || k > 0) ConnLog.add("Secure connection to ${addr.hostAddress} over $netName (TCP ${tcpMs} ms)")
+                return s
+            } catch (e: Exception) {
+                try { raw.close() } catch (_: Exception) {}
+                last = e
+                if (isCertChanged(e)) throw e
+                if (active && gen == generation) {
+                    val why = if (e is SocketTimeoutException && raw.isConnected) "TCP connected but the secure handshake got no answer within 8 s"
+                              else (e.message ?: e.javaClass.simpleName)
+                    ConnLog.add("Could not reach ${addr.hostAddress} over $netName: $why")
+                }
+            } finally {
+                if (pending === raw) pending = null
+            }
+        }
+        throw last ?: java.io.IOException("No connection")
+    }
+
+    private fun connectOnce(host: String, port: Int, chan: String, trust: Boolean, gen: Int) {
         setStatus("Connecting...")
         ConnLog.add("Connecting to $host:$port")
-        val factory: SSLSocketFactory = if (trust) pinningFactory(host, port) else SSLSocketFactory.getDefault() as SSLSocketFactory
-        val raw = Socket()
-        raw.keepAlive = true
-        raw.tcpNoDelay = true
-        raw.connect(InetSocketAddress(host, port), 10000)
-        raw.soTimeout = 15000                       // do not hang forever in the TLS handshake
-        val s = factory.createSocket(raw, host, port, true) as SSLSocket
-        s.startHandshake()
-        s.soTimeout = 0                             // reads may block for as long as the link is quiet
+        val s = openSecure(host, port, trust, gen, attempts)
+        if (!(active && gen == generation)) { try { s.close() } catch (_: Exception) {}; return }   // stopped or replaced while connecting: never become the live connection
         socket = s
         writer = PrintWriter(s.getOutputStream(), true)
         lastRx = SystemClock.elapsedRealtime()
@@ -443,6 +574,7 @@ object Remote {
         attempts = 0
         sendJson(JSONObject().put("type", "protocol_version").put("version", 2))
         sendJson(JSONObject().put("type", "join").put("channel", chan).put("connection_type", "master"))
+        flushStale()
         if (hadLoss) { hadLoss = false; ConnLog.add("Connection restored"); Cue.play("connection_restored") }
         else { ConnLog.add("Connected"); Cue.play("connected") }
         publish()
@@ -671,7 +803,7 @@ object Remote {
             val k = charToKey(c)
             if (k == null) { skipped++; continue }
             val (vk, shift) = k
-            val needShift = shift && !held.contains(0x10)
+            val needShift = shift && !isHeld(0x10)
             if (needShift) sendKey(0x10, false, true)
             tap(vk)
             if (needShift) sendKey(0x10, false, false)

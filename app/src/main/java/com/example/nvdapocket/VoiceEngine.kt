@@ -30,7 +30,8 @@ object VoiceEngine {
     /** Called on the main thread whenever the state or status text changes. */
     var listener: (() -> Unit)? = null
     private var errors = 0
-    private var awaitUntil = 0L
+    @Volatile var awaitUntil = 0L; private set      // after the wake word alone, the next sentence is the command until this time
+    @Volatile private var silentActive = false      // the silent offline engine is the one listening (see WakeEngine)
     private val restart = Runnable { listen() }
 
     fun init(c: Context) { app = c.applicationContext }
@@ -39,7 +40,7 @@ object VoiceEngine {
 
     fun hasMic(c: Context) = c.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
-    private fun setStatus(s: String) { statusText = s; main.post { listener?.invoke() } }
+    fun setStatus(s: String) { statusText = s; main.post { listener?.invoke() } }
 
     private fun recLang() = when (Voice.lang) { "fr" -> "fr-FR"; "ar" -> "ar-TN"; else -> "en-US" }
 
@@ -50,11 +51,13 @@ object VoiceEngine {
             if (on) return@post
             if (!hasMic(c)) { setStatus("Voice: microphone permission needed"); return@post }
             on = true; errors = 0; awaitUntil = 0
+            silentActive = silentWanted(c)
             try {
                 val i = Intent(c, VoiceService::class.java)
                 if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(i) else c.startService(i)
             } catch (e: Exception) { CrashLog.log("voice service", e) }
             setStatus(if (dictation) "Voice: dictation on (say stop dictation to end)" else "Voice: starting...")
+            if (silentPref(c) && !silentActive) setStatus("Voice: no offline voice model yet, using the Android recognizer. Download one in the Voice tab for silent listening.")
             Cue.play(firstCue) { listenSoon(100) }
         }
     }
@@ -64,6 +67,8 @@ object VoiceEngine {
             if (!on) return@post
             on = false; dictation = false
             main.removeCallbacks(restart)
+            WakeEngine.stop()
+            silentActive = false
             destroyRecognizer()
             app?.let { try { it.stopService(Intent(it, VoiceService::class.java)) } catch (_: Exception) {} }
             setStatus("Voice: off")
@@ -103,6 +108,7 @@ object VoiceEngine {
         if (!on) return
         val c = app ?: return
         if (!hasMic(c)) { setStatus("Voice: microphone permission needed"); stop(false); return }
+        if (silentActive) { WakeEngine.ensureStarted(c, Voice.lang); return }     // silent engine: no recogniser restarts, no beeps
         if (!SpeechRecognizer.isRecognitionAvailable(c)) { setStatus("Voice: speech recognition is not available on this phone"); stop(false); return }
         try {
             val r = rec ?: SpeechRecognizer.createSpeechRecognizer(c).also {
@@ -153,6 +159,37 @@ object VoiceEngine {
         }
     }
 
+    // ---------- the silent engine ----------
+    private fun silentPref(c: Context) = (Store.prefs(c).getString("vengine", "silent") ?: "silent") == "silent"
+    private fun silentWanted(c: Context) = silentPref(c) && VoiceModels.installed(c, Voice.lang)
+
+    /** A finished sentence from the silent engine (any thread). */
+    fun onVoiceText(text: String) {
+        main.post {
+            if (!on) return@post
+            var t = text.trim().lowercase()
+            if (t.isEmpty()) return@post
+            val p = prefs()
+            val wake = (p.getString("wake", "computer") ?: "").trim().lowercase()
+            if (!dictation && p.getBoolean("wakeOn", true) && wake.isNotEmpty() && SystemClock.uptimeMillis() >= awaitUntil) {
+                val i = t.indexOf(wake)
+                if (i < 0) return@post                 // not for us
+                t = t.substring(i)                      // drop any word recognised before the wake word
+            }
+            handle(listOf(t))
+        }
+    }
+
+    /** The silent engine could not run (no microphone, model would not load...). */
+    fun engineFailed(msg: String) {
+        main.post {
+            if (!on) return@post
+            Cue.play("cmd_fail")
+            stop(false)
+            main.post { setStatus("Voice: $msg") }      // after stop() has written "Voice: off", so the reason stays visible
+        }
+    }
+
     // ---------- what was heard ----------
     private fun handle(list: List<String>) {
         val low = list.map { it.lowercase() }
@@ -166,7 +203,7 @@ object VoiceEngine {
         }
         val p = prefs()
         var cands = list
-        val wakeOn = p.getBoolean("wakeOn", false)
+        val wakeOn = p.getBoolean("wakeOn", true)
         val wake = (p.getString("wake", "computer") ?: "").trim().lowercase()
         val now = SystemClock.uptimeMillis()
         if (wakeOn && wake.isNotEmpty() && now >= awaitUntil) {

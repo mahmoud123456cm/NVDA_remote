@@ -33,6 +33,8 @@ class ControlTab(act: MainActivity, ui: Ui) : Tab(act, ui) {
     private lateinit var pad: GesturePad
     private lateinit var capture: KeyCaptureView
     private lateinit var pcClipView: TextView
+    private val modToggles = HashMap<Int, ToggleButton>()
+    private var syncing = false
 
     override fun build(p: LinearLayout) {
         gcfg.load(act)
@@ -114,11 +116,14 @@ class ControlTab(act: MainActivity, ui: Ui) : Tab(act, ui) {
     }
 
     override fun onResume() {
+        Remote.heldListener = { syncMods() }
+        syncMods()
         Remote.clipListener = { t -> showPcClip(t) }
         Remote.lastPcClip?.let { showPcClip(it) }
     }
 
     override fun onPause() {
+        Remote.heldListener = null
         Remote.clipListener = null
         pad.learn = null
     }
@@ -182,10 +187,19 @@ class ControlTab(act: MainActivity, ui: Ui) : Tab(act, ui) {
 
     private fun mod(l: String, vk: Int, ext: Boolean = false) = ToggleButton(act).apply {
         textOn = "$l held"; textOff = l; text = l; isAllCaps = false; textSize = 11f
+        modToggles[vk] = this
         setOnCheckedChangeListener { _, on ->
-            if (on) Remote.held.add(vk) else Remote.held.remove(vk)
+            if (syncing) return@setOnCheckedChangeListener
+            Remote.setHeld(vk, on)
             Remote.sendKey(vk, ext, on)
         }
+    }
+
+    /** Makes the toggles show what is really held (keys are released when the connection drops or ends). */
+    private fun syncMods() {
+        syncing = true
+        for ((vk, t) in modToggles) t.isChecked = Remote.isHeld(vk)
+        syncing = false
     }
 
     private fun releaseAll() {

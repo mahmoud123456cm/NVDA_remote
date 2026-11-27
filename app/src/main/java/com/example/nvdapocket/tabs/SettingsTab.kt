@@ -1,6 +1,8 @@
 package com.example.nvdapocket.tabs
 
 import android.app.AlertDialog
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.provider.Settings
 import android.view.View
@@ -11,6 +13,7 @@ import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.Spinner
 import com.example.nvdapocket.App
+import com.example.nvdapocket.Backup
 import com.example.nvdapocket.CrashLog
 import com.example.nvdapocket.Cue
 import com.example.nvdapocket.VolKeys
@@ -99,6 +102,12 @@ class SettingsTab(act: MainActivity, ui: Ui) : Tab(act, ui) {
             act.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
         })
 
+        p.addView(ui.label("Backup of everything"))
+        p.addView(ui.note("Saves your connection profiles, macros, gestures and settings as text, so you can restore them after reinstalling or move them to another phone."))
+        p.addView(ui.row(
+            ui.button("Export backup") { exportBackup() },
+            ui.button("Import from clipboard") { importBackup() }))
+
         p.addView(ui.label("Updates"))
         p.addView(ui.note("Installed build: ${Updater.currentBuild(act)}"))
         p.addView(ui.button("Check for updates") { Updater.check(act) })
@@ -110,6 +119,37 @@ class SettingsTab(act: MainActivity, ui: Ui) : Tab(act, ui) {
             ui.button("View log") { viewLog() },
             ui.button("Send log") { shareLog() },
             ui.button("Clear log") { CrashLog.clear(act); ui.toast("Log cleared") }))
+    }
+
+    private fun exportBackup() {
+        AlertDialog.Builder(act).setTitle("Export backup")
+            .setMessage("Include your connection keys? They would be in the exported text in plain letters, so anyone who sees the text can join your channel. Without keys you type them in again after restoring.")
+            .setPositiveButton("Without keys") { _, _ -> shareBackup(false) }
+            .setNeutralButton("With keys") { _, _ -> shareBackup(true) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun shareBackup(includeKeys: Boolean) {
+        val i = Intent(Intent.ACTION_SEND).setType("text/plain")
+            .putExtra(Intent.EXTRA_SUBJECT, "${App.name(act)} backup")
+            .putExtra(Intent.EXTRA_TEXT, Backup.export(act, includeKeys))
+        act.startActivity(Intent.createChooser(i, "Save the backup (copy it, or send it to yourself)"))
+    }
+
+    private fun importBackup() {
+        val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = cm.primaryClip
+        val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(act)?.toString() else null
+        val b = if (text.isNullOrBlank()) null else Backup.parse(text)
+        if (b == null) { ui.toast("The clipboard does not hold a backup made by this app. Copy the exported text first."); return }
+        AlertDialog.Builder(act).setTitle("Import this backup?")
+            .setMessage(Backup.summary(b) + "\n\nOnly import a backup you made yourself: it can contain connection settings.")
+            .setPositiveButton("Import") { _, _ ->
+                Backup.apply(act, b)
+                ui.toast("Backup imported")
+                act.recreate()          // rebuild the screens so every tab shows the restored values
+            }
+            .setNegativeButton("Cancel", null).show()
     }
 
     private fun refreshSpeechButtons() {

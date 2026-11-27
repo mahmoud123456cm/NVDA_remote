@@ -34,7 +34,9 @@ object Cue {
     private class Item(val name: String, val onDone: (() -> Unit)?)
     private val queue = ArrayDeque<Item>()
     private var player: MediaPlayer? = null
-    private var playing = false
+    @Volatile private var playing = false
+    /** True while a clip is playing or queued, so the silent listener can ignore the microphone meanwhile. */
+    val busy: Boolean get() = playing
 
     fun init(c: Context) {
         app = c.applicationContext

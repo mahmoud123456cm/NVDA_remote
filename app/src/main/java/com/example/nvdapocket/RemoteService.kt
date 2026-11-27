@@ -22,6 +22,7 @@ import kotlin.math.sqrt
 /** Keeps the process alive so the connection keeps running in the background. */
 class RemoteService : Service() {
     private var wl: PowerManager.WakeLock? = null
+    private var wifi: android.net.wifi.WifiManager.WifiLock? = null
     private var sm: SensorManager? = null
     private var shakeOn = false
 
@@ -85,6 +86,13 @@ class RemoteService : Service() {
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nvdapocket:conn")
             wl?.acquire()
         }
+        // Without this Wi-Fi may go to sleep with the screen off, which shows up as the relay suddenly not answering.
+        if (wifi == null) try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+            @Suppress("DEPRECATION")
+            val mode = if (Build.VERSION.SDK_INT >= 29) android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY else android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wifi = wm.createWifiLock(mode, "nvdapocket:wifi").apply { setReferenceCounted(false); acquire() }
+        } catch (e: Exception) { CrashLog.log("wifilock", e) }
         if (!shakeOn && Store.prefs(this).getBoolean("shake", true)) {
             sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
             val acc = sm?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -97,6 +105,7 @@ class RemoteService : Service() {
         Remote.serviceListener = null
         try { sm?.unregisterListener(shake) } catch (_: Exception) {}
         try { wl?.release() } catch (_: Exception) {}
+        try { if (wifi?.isHeld == true) wifi?.release() } catch (_: Exception) {}
         super.onDestroy()
     }
 }
