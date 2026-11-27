@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <queries>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
+        <!-- Without this, Android 11+ hides every speech engine except Google's, so the list shows only one and the default engine is not found. -->
+        <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
     </queries>
     <application
         android:name=".App"

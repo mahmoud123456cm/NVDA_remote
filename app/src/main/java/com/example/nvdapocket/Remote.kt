@@ -13,6 +13,7 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -48,6 +49,9 @@ object Remote {
     private var socket: SSLSocket? = null
     private var writer: PrintWriter? = null
     private val sender = Executors.newSingleThreadExecutor()
+    private val speaker = Executors.newSingleThreadExecutor()          // speech runs here so a slow engine can never stall reading from the server
+    private val pendingSpeech = java.util.concurrent.atomic.AtomicInteger(0)
+    private const val MAX_SPEECH_BACKLOG = 5                            // beyond this, old queued speech is dropped so you hear the latest text
     private val ui = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
     @Volatile private var ttsReady = false
@@ -117,7 +121,21 @@ object Remote {
         val listener = TextToSpeech.OnInitListener { st ->
             if (g == ttsGen) {
                 ttsReady = st == TextToSpeech.SUCCESS
-                if (ttsReady) { applyTts(); applyVoice(); ui.post { ttsListener?.invoke() } }
+                if (ttsReady) {
+                    applyTts(); applyVoice()
+                    try {
+                        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                            private fun done(id: String?) { if (id != null && id.startsWith("pc") && pendingSpeech.get() > 0) pendingSpeech.decrementAndGet() }
+                            override fun onStart(utteranceId: String?) {}
+                            override fun onDone(utteranceId: String?) = done(utteranceId)
+                            @Deprecated("Deprecated in Java")
+                            override fun onError(utteranceId: String?) = done(utteranceId)
+                            override fun onError(utteranceId: String?, errorCode: Int) = done(utteranceId)
+                            override fun onStop(utteranceId: String?, interrupted: Boolean) = done(utteranceId)
+                        })
+                    } catch (e: Exception) { CrashLog.log("tts listener", e) }
+                    ui.post { ttsListener?.invoke() }
+                }
                 else if (ttsEngine != null) ui.post { fallBackToDefaultEngine() }   // the chosen engine would not start
             }
         }
@@ -250,7 +268,7 @@ object Remote {
                     Cue.play("connection_lost")
                 }
                 attempts++
-                val delaySec = minOf(30, 2 shl minOf(attempts - 1, 4))   // 2, 4, 8, 16, 30, 30...
+                val delaySec = if (attempts == 1) 1 else minOf(30, 2 shl minOf(attempts - 2, 4))   // 1, 2, 4, 8, 16, 30...
                 var left = delaySec
                 while (left > 0 && active && gen == generation && !retryNow) {
                     setStatus("Connection lost. Reconnecting in $left s (attempt $attempts)" + (lastError?.let { ": $it" } ?: ""))
@@ -430,7 +448,10 @@ object Remote {
         publish()
         startKeepAlive(s)
         val r = BufferedReader(InputStreamReader(s.getInputStream()))
-        r.forEachLine { lastRx = SystemClock.elapsedRealtime(); handle(it) }
+        r.forEachLine {
+            lastRx = SystemClock.elapsedRealtime()
+            try { handle(it) } catch (e: Exception) { CrashLog.log("handle", e) }   // one bad message must never drop the connection
+        }
         if (active) ConnLog.add("The server closed the connection after ${(SystemClock.elapsedRealtime() - connectedAt) / 1000} s")
     }
 
@@ -457,6 +478,19 @@ object Remote {
         }.apply { isDaemon = true; start() }
     }
 
+    /** Speaks text from the PC on its own thread. If the engine falls behind, older waiting speech is dropped. */
+    private fun speakFromPc(t: String) {
+        speaker.execute {
+            try {
+                val e = tts ?: return@execute
+                val behind = pendingSpeech.get() >= MAX_SPEECH_BACKLOG
+                if (behind) pendingSpeech.set(0)
+                pendingSpeech.incrementAndGet()
+                e.speak(t, if (behind) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, "pc" + System.nanoTime())
+            } catch (ex: Exception) { CrashLog.log("speak", ex) }
+        }
+    }
+
     private fun handle(line: String) {
         val m = try { JSONObject(line) } catch (_: Exception) { return }
         when (m.optString("type")) {
@@ -466,13 +500,13 @@ object Remote {
                 for (i in 0 until seq.length()) (seq.opt(i) as? String)?.let { if (it.isNotBlank()) sb.append(it).append(' ') }
                 val t = sb.toString().trim()
                 if (t.isNotEmpty() && addToCapture(t)) return   // being captured as clipboard text: don't read it aloud
-                if (t.isNotEmpty() && speak && ttsReady) tts?.speak(t, TextToSpeech.QUEUE_ADD, null, null)
+                if (t.isNotEmpty() && speak && ttsReady) speakFromPc(t)
             }
             "set_clipboard_text" -> {
                 val t = m.optString("text", "")
                 if (t.isNotEmpty() && t != lastSentClip) ui.post { onPcClipboard(t, false) }
             }
-            "cancel" -> if (ttsReady) tts?.stop()
+            "cancel" -> if (ttsReady) speaker.execute { try { pendingSpeech.set(0); tts?.stop() } catch (_: Exception) {} }
             "ping", "pong" -> {
                 serverTalks = true
                 val sent = pingSentAt

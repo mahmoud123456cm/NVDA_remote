@@ -26,3 +26,11 @@ New in 3.4 (connection fixes):
 - Failed sends are noticed straight away and trigger a reconnect.
 - The TLS handshake has a 15 s timeout.
 - Connection history now says how long the connection lasted before it was lost.
+
+New in 3.5:
+- All installed speech engines are now listed and the system default engine is used (the manifest was missing the TTS_SERVICE query,
+  so Android 11+ hid every engine except Google's).
+- Speech from the PC is spoken on its own thread, so a slow speech engine can no longer stall the connection. If the engine falls
+  behind, old queued speech is dropped so you always hear the latest text.
+- One bad message or an error while speaking can no longer drop the connection.
+- The first reconnect after a drop happens after 1 second instead of 2.
