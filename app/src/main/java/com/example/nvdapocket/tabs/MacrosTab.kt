@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.widget.Button
 import android.widget.LinearLayout
+import com.example.nvdapocket.App
 import com.example.nvdapocket.MacroEditor
 import com.example.nvdapocket.MainActivity
 import com.example.nvdapocket.Remote
@@ -94,7 +95,7 @@ class MacrosTab(act: MainActivity, ui: Ui) : Tab(act, ui) {
         val ms = Store.macros(act)
         if (ms.isEmpty()) { ui.toast("No macros to export"); return }
         val i = Intent(Intent.ACTION_SEND).setType("text/plain")
-            .putExtra(Intent.EXTRA_SUBJECT, "NVDA Pocket macros")
+            .putExtra(Intent.EXTRA_SUBJECT, "${App.name(act)} macros")
             .putExtra(Intent.EXTRA_TEXT, Store.macrosToJson(ms))
         act.startActivity(Intent.createChooser(i, "Export macros"))
     }

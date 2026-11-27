@@ -13,7 +13,7 @@ class ConnectTile : TileService() {
     private fun update() {
         val t = qsTile ?: return
         t.state = if (Remote.active) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-        t.label = "NVDA Pocket"
+        t.label = App.name(this)
         t.updateTile()
     }
 

@@ -11,6 +11,7 @@ import android.os.Looper
 import android.view.KeyEvent
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -20,6 +21,7 @@ import com.example.nvdapocket.tabs.ControlTab
 import com.example.nvdapocket.tabs.MacrosTab
 import com.example.nvdapocket.tabs.NvdaTab
 import com.example.nvdapocket.tabs.SettingsTab
+import com.example.nvdapocket.tabs.SupportTab
 import com.example.nvdapocket.tabs.Tab
 import com.example.nvdapocket.tabs.VoiceTab
 import com.example.nvdapocket.ui.Ui
@@ -86,6 +88,7 @@ class MainActivity : Activity() {
         tabs.add(voiceTab)
         tabs.add(MacrosTab(this, ui))
         tabs.add(settingsTab)
+        tabs.add(SupportTab(this, ui))
 
         // The tabs sit in fixed rows of three, never in a scroller, so a swipe can't push Connect or Settings off screen.
         val tabBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(ui.dp(4), 0, ui.dp(4), 0) }
@@ -97,6 +100,8 @@ class MainActivity : Activity() {
             tabBtns.add(tb)
             tabRow!!.addView(tb, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
+        // keep the buttons of a short last row the same width as the others
+        repeat((3 - tabs.size % 3) % 3) { tabRow!!.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f)) }
         outer.addView(tabBox)
 
         content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }

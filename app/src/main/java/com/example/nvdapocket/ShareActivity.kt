@@ -14,7 +14,7 @@ class ShareActivity : Activity() {
         val text = intent?.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
         if (text.isNullOrEmpty()) { finish(); return }
         if (!Remote.connected) {
-            Toast.makeText(this, "Not connected. Open NVDA Pocket and connect first.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Not connected. Open ${App.name(this)} and connect first.", Toast.LENGTH_LONG).show()
             finish(); return
         }
         val mode = Store.prefs(this).getString("shareMode", "ask") ?: "ask"

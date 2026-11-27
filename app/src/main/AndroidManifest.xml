@@ -15,7 +15,7 @@
     </queries>
     <application
         android:name=".App"
-        android:label="NVDA Pocket"
+        android:label="@string/app_name"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
             android:name=".MainActivity"
@@ -64,7 +64,7 @@
         <service
             android:name=".ConnectTile"
             android:exported="true"
-            android:label="NVDA Pocket"
+            android:label="@string/app_name"
             android:icon="@android:drawable/ic_dialog_info"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>

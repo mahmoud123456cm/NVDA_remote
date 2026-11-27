@@ -50,7 +50,12 @@ object Remote {
     private val sender = Executors.newSingleThreadExecutor()
     private val ui = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
-    private var ttsReady = false
+    @Volatile private var ttsReady = false
+    @Volatile private var ttsGen = 0            // bumps each time the speech engine is recreated, so a late start-up callback of an old one is ignored
+    private var ttsEngine: String? = null       // package name of the chosen engine, null = the system default
+    private var ttsVoiceName: String? = null    // chosen voice, null = the engine's default
+    /** Called on the main thread when a (new) speech engine has finished starting. */
+    var ttsListener: (() -> Unit)? = null
     private var base = "Not connected"
     var lastStatus = "Not connected"
     var statusListener: ((String) -> Unit)? = null
@@ -88,11 +93,92 @@ object Remote {
     fun initTts(ctx: Context) {
         val app = ctx.applicationContext
         appCtx = app
-        clipIn = Store.prefs(app).getBoolean("clipIn", true)
-        if (tts == null) tts = TextToSpeech(app) { st -> ttsReady = st == TextToSpeech.SUCCESS; if (ttsReady) applyTts() }
+        val p = Store.prefs(app)
+        clipIn = p.getBoolean("clipIn", true)
+        if (tts == null) {
+            ttsEngine = p.getString("ttsEngine", null)?.ifEmpty { null }
+            ttsVoiceName = p.getString("ttsVoice", null)?.ifEmpty { null }
+            createTts()
+        }
+    }
+
+    /** (Re)creates the speech engine from the saved choice. This is what makes a new engine or voice take effect. */
+    private fun createTts() {
+        val app = appCtx ?: return
+        val g = ++ttsGen
+        ttsReady = false
+        try { tts?.stop(); tts?.shutdown() } catch (_: Exception) {}
+        tts = null
+        val listener = TextToSpeech.OnInitListener { st ->
+            if (g == ttsGen) {
+                ttsReady = st == TextToSpeech.SUCCESS
+                if (ttsReady) { applyTts(); applyVoice(); ui.post { ttsListener?.invoke() } }
+                else if (ttsEngine != null) ui.post { fallBackToDefaultEngine() }   // the chosen engine would not start
+            }
+        }
+        val eng = ttsEngine
+        tts = try {
+            if (eng == null) TextToSpeech(app, listener) else TextToSpeech(app, listener, eng)
+        } catch (e: Exception) { CrashLog.log("tts", e); null }
+    }
+
+    private fun fallBackToDefaultEngine() {
+        val c = appCtx ?: return
+        ConnLog.add("The chosen speech engine would not start, using the system default")
+        ttsEngine = null; ttsVoiceName = null
+        Store.prefs(c).edit().remove("ttsEngine").remove("ttsVoice").apply()
+        createTts()
+    }
+
+    private fun applyVoice() {
+        val name = ttsVoiceName ?: return
+        try { tts?.voices?.firstOrNull { it.name == name }?.let { tts?.setVoice(it) } } catch (e: Exception) { CrashLog.log("tts voice", e) }
     }
 
     fun applyTts() { tts?.setSpeechRate(ttsRate); tts?.setPitch(ttsPitch) }
+
+    // ----- choosing the speech engine and voice (Settings tab) -----
+    fun ttsIsReady() = ttsReady
+    fun ttsEngineName(): String? = ttsEngine
+    fun ttsVoiceName(): String? = ttsVoiceName
+
+    /** Installed speech engines as (package, label). */
+    fun ttsEngines(): List<Pair<String, String>> = try {
+        tts?.engines?.map { it.name to it.label } ?: emptyList()
+    } catch (e: Exception) { CrashLog.log("tts engines", e); emptyList() }
+
+    fun currentEngineLabel(): String {
+        val e = ttsEngine ?: try { tts?.defaultEngine } catch (_: Exception) { null }
+        return ttsEngines().firstOrNull { it.first == e }?.second ?: (e ?: "System default")
+    }
+
+    /** null = the system default engine. */
+    fun setEngine(pkg: String?) {
+        val c = appCtx ?: return
+        ttsEngine = pkg; ttsVoiceName = null
+        val ed = Store.prefs(c).edit().remove("ttsVoice")
+        if (pkg == null) ed.remove("ttsEngine") else ed.putString("ttsEngine", pkg)
+        ed.apply()
+        createTts()
+    }
+
+    /** The voices of the running engine (empty until it has finished starting). */
+    fun ttsVoices(): List<android.speech.tts.Voice> = try {
+        tts?.voices?.sortedWith(compareBy({ it.locale.displayName }, { it.name })) ?: emptyList()
+    } catch (e: Exception) { CrashLog.log("tts voices", e); emptyList() }
+
+    /** null = the engine's default voice. */
+    fun setVoice(name: String?) {
+        val c = appCtx ?: return
+        ttsVoiceName = name
+        val ed = Store.prefs(c).edit()
+        if (name == null) ed.remove("ttsVoice") else ed.putString("ttsVoice", name)
+        ed.apply()
+        if (name == null) createTts() else applyVoice()   // there is no way to unset a voice, so go back to the engine default by restarting it
+    }
+
+    /** Restarts the speech engine, for example after the user changed the default in Android's own settings. */
+    fun reinitTts() { createTts() }
 
     fun applySpeak(b: Boolean) { speak = b; if (!b) tts?.stop(); publish() }
     fun toggleMute() { applySpeak(!speak); vibrate(60); Cue.play(if (speak) "unmuted" else "muted") }
@@ -383,7 +469,7 @@ object Remote {
         val c = appCtx ?: return false
         return try {
             val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText("NVDA Pocket", text))
+            cm.setPrimaryClip(ClipData.newPlainText("PC clipboard", text))
             true
         } catch (e: Exception) { CrashLog.log("clipboard", e); false }
     }

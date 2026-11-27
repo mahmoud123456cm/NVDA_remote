@@ -9,6 +9,7 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Spinner
+import com.example.nvdapocket.App
 import com.example.nvdapocket.ConnLog
 import com.example.nvdapocket.MainActivity
 import com.example.nvdapocket.Remote
@@ -88,7 +89,7 @@ class ConnectTab(act: MainActivity, ui: Ui) : Tab(act, ui) {
         val t = ConnLog.read()
         if (t.isEmpty()) { ui.toast("No connection history yet"); return }
         val i = Intent(Intent.ACTION_SEND).setType("text/plain")
-            .putExtra(Intent.EXTRA_SUBJECT, "NVDA Pocket connection history")
+            .putExtra(Intent.EXTRA_SUBJECT, "${App.name(act)} connection history")
             .putExtra(Intent.EXTRA_TEXT, t)
         act.startActivity(Intent.createChooser(i, "Send history"))
     }

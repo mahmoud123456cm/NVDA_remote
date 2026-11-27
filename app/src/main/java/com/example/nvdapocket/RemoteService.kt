@@ -53,7 +53,7 @@ class RemoteService : Service() {
             return Notification.Action.Builder(Icon.createWithResource(this, android.R.drawable.ic_menu_info_details), label, pi).build()
         }
         val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "remote") else Notification.Builder(this)
-        b.setContentTitle("NVDA Pocket")
+        b.setContentTitle(App.name(this))
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(open)

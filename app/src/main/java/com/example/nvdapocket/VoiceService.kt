@@ -27,7 +27,7 @@ class VoiceService : Service() {
         val open = PendingIntent.getActivity(this, 10, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val stop = PendingIntent.getService(this, 11, Intent(this, VoiceService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE)
         val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "voice") else Notification.Builder(this)
-        b.setContentTitle("NVDA Pocket voice commands")
+        b.setContentTitle(App.name(this) + " voice commands")
             .setContentText("Listening for commands")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(open)
