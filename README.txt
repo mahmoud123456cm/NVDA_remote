@@ -18,3 +18,11 @@ New in 3.3:
 - Sound effects with the voice cues, with a cue style setting (sound and voice / voice only / sound only).
 - Support tab: WhatsApp and email, with a ready-made message that can include app and phone details.
 - New app name.
+
+New in 3.4 (connection fixes):
+- Fixed the repeated "Connection lost": the watchdog cut quiet but healthy connections after about 90 s of silence from the relay.
+  It now only reconnects when the relay is known to answer pings (3 answered in a row) and the keep-alive setting is on.
+- A network change no longer drops a working connection at once: the link is checked with a ping first.
+- Failed sends are noticed straight away and trigger a reconnect.
+- The TLS handshake has a 15 s timeout.
+- Connection history now says how long the connection lasted before it was lost.

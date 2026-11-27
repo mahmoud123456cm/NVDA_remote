@@ -73,6 +73,11 @@ object Remote {
     @Volatile private var currentNet: Network? = null
     private const val PING_MS = 25_000L
     private const val WATCHDOG_MS = 90_000L
+    private const val ECHO_MS = 15_000L          // a ping/pong this soon after our ping counts as the relay answering us
+    private const val ECHOES_NEEDED = 3          // the relay must have answered this many pings before silence is treated as a dead link
+    @Volatile private var pingSentAt = 0L
+    @Volatile private var echoes = 0             // pings the relay has answered quickly on this connection
+    @Volatile private var connectedAt = 0L
 
     private class CertChangedException(msg: String) : CertificateException(msg)
 
@@ -241,7 +246,7 @@ object Remote {
                 if (wasUp) {
                     hadLoss = true
                     attempts = 0
-                    ConnLog.add("Connection lost")
+                    ConnLog.add("Connection lost after ${(SystemClock.elapsedRealtime() - connectedAt) / 1000} s" + (lastError?.let { " ($it)" } ?: ""))
                     Cue.play("connection_lost")
                 }
                 attempts++
@@ -307,6 +312,36 @@ object Remote {
         synchronized(reconnectLock) { retryNow = true; reconnectLock.notifyAll() }
     }
 
+    /** Sends a ping now and drops the connection if nothing at all arrives within 8 seconds. */
+    private fun probeConnection() {
+        val s = socket ?: return
+        val before = lastRx
+        sendPing(s)
+        Thread {
+            try { Thread.sleep(8000) } catch (_: InterruptedException) { return@Thread }
+            if (socket === s && connected && lastRx == before) {
+                ConnLog.add("No answer after the network change, reconnecting")
+                try { s.close() } catch (_: Exception) {}
+            }
+        }.apply { isDaemon = true; start() }
+    }
+
+    private fun sendPing(s: SSLSocket) {
+        sender.execute {
+            val w = writer
+            if (socket === s && w != null) {
+                try {
+                    pingSentAt = SystemClock.elapsedRealtime()
+                    w.println("{\"type\":\"ping\"}"); w.flush()
+                    if (w.checkError()) {
+                        ConnLog.add("The keep-alive could not be sent, reconnecting")
+                        try { s.close() } catch (_: Exception) {}
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     // ---------- watching the network ----------
     private fun watchNetwork(app: Context) {
         unwatchNetwork(app)
@@ -317,7 +352,11 @@ object Remote {
                 currentNet = n
                 if (prev != null && prev != n) {
                     ConnLog.add("Network changed")
-                    if (connected) { ConnLog.add("Dropping the connection to use the new network"); closeSocket() }
+                    if (connected) {
+                        val oldAlive = try { cm.getNetworkCapabilities(prev) != null } catch (_: Exception) { false }
+                        if (oldAlive && echoes >= ECHOES_NEEDED) probeConnection()   // old network still exists and the relay answers pings: just check the link
+                        else { ConnLog.add("Dropping the connection to use the new network"); closeSocket() }
+                    }
                 } else if (prev == null) ConnLog.add("Network available")
                 kick()
             }
@@ -369,13 +408,19 @@ object Remote {
         val factory: SSLSocketFactory = if (trust) pinningFactory(host, port) else SSLSocketFactory.getDefault() as SSLSocketFactory
         val raw = Socket()
         raw.keepAlive = true
+        raw.tcpNoDelay = true
         raw.connect(InetSocketAddress(host, port), 10000)
+        raw.soTimeout = 15000                       // do not hang forever in the TLS handshake
         val s = factory.createSocket(raw, host, port, true) as SSLSocket
         s.startHandshake()
+        s.soTimeout = 0                             // reads may block for as long as the link is quiet
         socket = s
         writer = PrintWriter(s.getOutputStream(), true)
         lastRx = SystemClock.elapsedRealtime()
+        connectedAt = lastRx
         serverTalks = false
+        echoes = 0
+        pingSentAt = 0L
         connected = true
         attempts = 0
         sendJson(JSONObject().put("type", "protocol_version").put("version", 2))
@@ -386,35 +431,28 @@ object Remote {
         startKeepAlive(s)
         val r = BufferedReader(InputStreamReader(s.getInputStream()))
         r.forEachLine { lastRx = SystemClock.elapsedRealtime(); handle(it) }
-        if (active) ConnLog.add("The server closed the connection")
+        if (active) ConnLog.add("The server closed the connection after ${(SystemClock.elapsedRealtime() - connectedAt) / 1000} s")
     }
 
-    /** Sends a small ping now and then and drops the connection when the relay has gone silent. */
+    /**
+     * Sends a small ping now and then. The connection is only declared dead when the relay has been proven to answer
+     * our pings (so silence really means trouble) and pings are switched on. A relay that never answers and is just
+     * quiet is left alone: a quiet link is normal, and cutting it was the cause of the repeated "connection lost".
+     */
     private fun startKeepAlive(s: SSLSocket) {
         Thread {
             while (socket === s && connected && active) {
                 try { Thread.sleep(PING_MS) } catch (_: InterruptedException) { return@Thread }
                 if (socket !== s || !connected) return@Thread
+                val c = appCtx
+                val pingOn = c == null || Store.prefs(c).getBoolean("ping", true)
                 val idle = SystemClock.elapsedRealtime() - lastRx
-                if (serverTalks && idle > WATCHDOG_MS) {
-                    ConnLog.add("Nothing from the server for ${idle / 1000} s, reconnecting")
+                if (pingOn && echoes >= ECHOES_NEEDED && idle > WATCHDOG_MS) {
+                    ConnLog.add("Nothing from the server for ${idle / 1000} s although it normally answers, reconnecting")
                     try { s.close() } catch (_: Exception) {}
                     return@Thread
                 }
-                val c = appCtx
-                if (c != null && !Store.prefs(c).getBoolean("ping", true)) continue
-                sender.execute {
-                    val w = writer
-                    if (socket === s && w != null) {
-                        try {
-                            w.println("{\"type\":\"ping\"}"); w.flush()
-                            if (w.checkError()) {
-                                ConnLog.add("The keep-alive could not be sent, reconnecting")
-                                try { s.close() } catch (_: Exception) {}
-                            }
-                        } catch (_: Exception) {}
-                    }
-                }
+                if (pingOn) sendPing(s)
             }
         }.apply { isDaemon = true; start() }
     }
@@ -435,7 +473,11 @@ object Remote {
                 if (t.isNotEmpty() && t != lastSentClip) ui.post { onPcClipboard(t, false) }
             }
             "cancel" -> if (ttsReady) tts?.stop()
-            "ping", "pong" -> serverTalks = true
+            "ping", "pong" -> {
+                serverTalks = true
+                val sent = pingSentAt
+                if (sent != 0L && SystemClock.elapsedRealtime() - sent < ECHO_MS) { pingSentAt = 0L; echoes++ }
+            }
             "channel_joined" -> {
                 var n = 0
                 val cl = m.optJSONArray("clients")
@@ -554,7 +596,17 @@ object Remote {
     // ---------- sending ----------
     fun sendJson(o: JSONObject) {
         if (!connected) return
-        sender.execute { try { writer?.println(o.toString()); writer?.flush() } catch (_: Exception) {} }
+        val s = socket
+        sender.execute {
+            try {
+                val w = writer
+                w?.println(o.toString()); w?.flush()
+                if (w != null && w.checkError() && socket === s) {
+                    ConnLog.add("Sending failed, reconnecting")
+                    try { s?.close() } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     fun sendKey(vk: Int, ext: Boolean, pressed: Boolean) {
