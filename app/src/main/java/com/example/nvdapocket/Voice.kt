@@ -148,6 +148,62 @@ object Voice {
     private fun numOf(t: String, loose: Boolean): Int? =
         t.toIntOrNull() ?: numWords[t] ?: (if (loose) homoWords[t] else null)
 
+
+    // ---------------- vocabulary for the offline recogniser ----------------
+    /** Changes whenever the custom macros change, so the offline recogniser knows to rebuild its vocabulary. */
+    fun grammarStamp(): Int = lang.hashCode() * 31 + macrosCache.joinToString("|") { it.name + "=" + it.phrase }.hashCode()
+
+    /**
+     * Everything that can be said as a command, in the voice language. The offline recogniser is restricted to this
+     * vocabulary, so "copy" can no longer be heard as "coffee". Free text ("type ...") and dictation are not in it:
+     * they fall back to the open recogniser.
+     */
+    fun grammarPhrases(wake: String): List<String> {
+        val out = LinkedHashSet<String>()
+        fun add(s: String) { val t = s.trim().lowercase(); if (t.isNotEmpty()) out.add(t) }
+        if (wake.isNotBlank()) add(wake)
+        for (m in macrosCache) { add(m.name); m.phrases().forEach { add(it) } }
+        builtinPhrases().forEach { add(it) }
+        val mods = ArrayList<String>(); val keys = ArrayList<String>()
+        fun addAll(map: List<Pair<String, String>>) {
+            for ((spoken, meaning) in map) {
+                val first = meaning.trim().split(' ').firstOrNull().orEmpty()
+                when {
+                    meaning.isBlank() -> add(spoken)                           // filler like "fois" / "touche"
+                    meaning.contains(' ') -> add(spoken)                       // a whole command ("select all")
+                    modWords.containsKey(first) -> { mods.add(spoken); add(spoken) }
+                    else -> { keys.add(spoken); add(spoken) }
+                }
+            }
+        }
+        when (lang) {
+            "fr" -> addAll(fr)
+            "ar" -> addAll(ar)
+            else -> {
+                macroList.forEach { add(it.first) }
+                modWords.keys.filter { it != "nvidia" && it != "invidia" && it != "envy" && it != "window" }.forEach { mods.add(it); add(it) }
+                keys.addAll(listOf("enter", "tab", "escape", "space", "backspace", "delete", "up", "down", "left", "right",
+                    "home", "end", "page up", "page down", "caps lock", "menu", "print screen", "numpad plus", "numpad minus"))
+                keys.addAll(nato.keys); keys.addAll(numWords.keys.filter { it != "eleven" && it != "twelve" })
+                for (n in 1..12) keys.add("f " + (numWords.entries.firstOrNull { it.value == n }?.key ?: n.toString()))
+                for (c in 'a'..'z') keys.add(c.toString())
+                keys.forEach { add(it) }
+                for (n in listOf("two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")) {   // "down three times"
+                    for (k in listOf("up", "down", "left", "right", "tab", "enter", "backspace", "delete", "page up", "page down")) {
+                        add("$k $n"); add("$k $n times")
+                    }
+                }
+                add("nvda"); add("stop listening"); add("start dictation")
+            }
+        }
+        val m1 = mods.distinct().take(8)
+        val k1 = keys.distinct()
+        for (m in m1) for (k in k1) add("$m $k")
+        val m2 = m1.filter { it in setOf("control", "alt", "shift", "windows", "contrôle", "majuscule", "تحكم", "شيفت", "ويندوز") }
+        for (a in m2) for (b in m2) if (a != b) for (k in k1) add("$a $b $k")
+        return out.toList()
+    }
+
     // ---------------- parsing ----------------
     fun parse(raw: String, fromVoice: Boolean): List<Act> {
         if (!fromVoice) memo[raw]?.let { return it }

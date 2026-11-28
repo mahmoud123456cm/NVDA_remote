@@ -164,7 +164,7 @@ object VoiceEngine {
     private fun silentWanted(c: Context) = silentPref(c) && VoiceModels.installed(c, Voice.lang)
 
     /** A finished sentence from the silent engine (any thread). */
-    fun onVoiceText(text: String) {
+    fun onVoiceText(text: String, gated: Boolean = false) {
         main.post {
             if (!on) return@post
             var t = text.trim().lowercase()
@@ -173,8 +173,9 @@ object VoiceEngine {
             val wake = (p.getString("wake", "computer") ?: "").trim().lowercase()
             if (!dictation && p.getBoolean("wakeOn", true) && wake.isNotEmpty() && SystemClock.uptimeMillis() >= awaitUntil) {
                 val i = t.indexOf(wake)
-                if (i < 0) return@post                 // not for us
-                t = t.substring(i)                      // drop any word recognised before the wake word
+                if (i >= 0) t = t.substring(i)          // drop any word recognised before the wake word
+                else if (gated) t = "$wake $t"          // the wake-word detector did hear it, the full text just spelled it differently
+                else return@post                        // not for us
             }
             handle(listOf(t))
         }

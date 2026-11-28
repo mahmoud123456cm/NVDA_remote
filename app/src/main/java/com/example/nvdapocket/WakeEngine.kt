@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AutomaticGainControl
 import android.os.SystemClock
 import org.json.JSONArray
 import org.json.JSONObject
@@ -23,6 +24,9 @@ import java.io.IOException
  *    "computer, select all" said in one breath works, and then runs until the sentence is finished.
  * With the wake word switched off, or in dictation, only the full recogniser runs. Every finished sentence goes to
  * VoiceEngine.onVoiceText, the same path the Android recogniser uses.
+ * In the command stage a third recogniser (the "command" one) is restricted to the words that can be a command, which
+ * is what makes short commands reliable with the small offline models. The open one still runs next to it, and its
+ * text is used for anything outside the command vocabulary ("type hello", dictation).
  * While one of the app's own cues (or, if chosen, the phone's speech) is playing, the audio is thrown away so the
  * phone never hears itself.
  */
@@ -72,6 +76,8 @@ object WakeEngine {
         var model: Model? = null
         var gate: Recognizer? = null
         var free: Recognizer? = null
+        var cmd: Recognizer? = null
+        var agc: AutomaticGainControl? = null
         var ar: AudioRecord? = null
         var failure: String? = null
         try {
@@ -85,6 +91,7 @@ object WakeEngine {
             val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, CHUNK * 2 * 4))
             ar = rec
+            try { if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(rec.audioSessionId)?.also { it.enabled = true } } catch (_: Exception) {}
             if (rec.state != AudioRecord.STATE_INITIALIZED) throw IOException("the microphone could not be opened (is another app using it?)")
             rec.startRecording()
 
@@ -100,6 +107,32 @@ object WakeEngine {
             var inGate = false
             var wasDeaf = false
             var shown = ""
+            var cmdStamp = 0
+            var cmdWake = ""
+            var cmdBroken = false
+            var openAcc = ""          // text the open recogniser finished before the command recogniser did
+
+            /** The restricted command recogniser, rebuilt when the wake word, language or macros change. */
+            fun ensureCmd(): Recognizer? {
+                if (cmdBroken) return null
+                val stamp = Voice.grammarStamp()
+                val c = cmd
+                if (c != null && cmdStamp == stamp && cmdWake == wake) return c
+                try { c?.close() } catch (_: Exception) {}
+                cmd = null
+                return try {
+                    val json = JSONArray()
+                    for (p in Voice.grammarPhrases(wake)) json.put(p)
+                    json.put("[unk]")
+                    val r = Recognizer(model, RATE.toFloat(), json.toString())
+                    cmd = r; cmdStamp = stamp; cmdWake = wake
+                    r
+                } catch (e: Throwable) {
+                    cmdBroken = true        // this model has no restricted mode: keep using the open recogniser
+                    CrashLog.log("command grammar", e)
+                    null
+                }
+            }
 
             while (running) {
                 val n = rec.read(buf, 0, buf.size)
@@ -118,7 +151,7 @@ object WakeEngine {
                 // never listen to ourselves
                 val deaf = Cue.busy || (ignoreSelf && Remote.ttsBusy())
                 if (deaf) {
-                    if (!wasDeaf) { wasDeaf = true; gate?.reset(); full.reset(); ring.clear(); triggered = false; inGate = false }
+                    if (!wasDeaf) { wasDeaf = true; gate?.reset(); full.reset(); cmd?.reset(); openAcc = ""; ring.clear(); triggered = false; inGate = false }
                     continue
                 }
                 wasDeaf = false
@@ -150,17 +183,41 @@ object WakeEngine {
                         full.reset()
                         val pre = ring.snapshot()
                         if (full.acceptWaveForm(pre, pre.size)) full.result    // discard: it was only the lead-in
+                        openAcc = ""
+                        val cr = ensureCmd()
+                        if (cr != null) { cr.reset(); if (cr.acceptWaveForm(pre, pre.size)) cr.result }
                         g.reset()
                     }
                 } else {
                     inGate = false
-                    val end = full.acceptWaveForm(buf, n)
-                    if (end) {
-                        val text = textOf(full.result).trim()
-                        full.reset(); g?.reset(); ring.clear(); triggered = false
-                        if (text.isNotEmpty()) VoiceEngine.onVoiceText(text)
-                    } else if (triggered && now - triggerAt > TRIGGER_MS) {
-                        full.reset(); g?.reset(); ring.clear(); triggered = false
+                    val cr = if (VoiceEngine.dictation) null else ensureCmd()
+                    if (cr != null) {
+                        // command stage: restricted recogniser decides, the open one covers free text
+                        val cEnd = cr.acceptWaveForm(buf, n)
+                        val fEnd = full.acceptWaveForm(buf, n)
+                        if (fEnd) openAcc = (openAcc + " " + textOf(full.result)).trim()
+                        if (cEnd) {
+                            val cText = textOf(cr.result).trim()
+                            if (!fEnd) openAcc = (openAcc + " " + textOf(full.finalResult)).trim()
+                            val open = openAcc.trim()
+                            val clean = cText.replace("[unk]", " ").trim().replace(Regex("\\s+"), " ")
+                            val text = if (cText.isNotEmpty() && !cText.contains("[unk]")) cText else if (open.isNotEmpty()) open else clean
+                            val gated = triggered
+                            full.reset(); cr.reset(); g?.reset(); ring.clear(); triggered = false; openAcc = ""
+                            if (text.isNotEmpty()) VoiceEngine.onVoiceText(text, gated)
+                        } else if (triggered && now - triggerAt > TRIGGER_MS) {
+                            full.reset(); cr.reset(); g?.reset(); ring.clear(); triggered = false; openAcc = ""
+                        }
+                    } else {
+                        val end = full.acceptWaveForm(buf, n)
+                        if (end) {
+                            val text = textOf(full.result).trim()
+                            val gated = triggered
+                            full.reset(); g?.reset(); ring.clear(); triggered = false
+                            if (text.isNotEmpty()) VoiceEngine.onVoiceText(text, gated)
+                        } else if (triggered && now - triggerAt > TRIGGER_MS) {
+                            full.reset(); g?.reset(); ring.clear(); triggered = false
+                        }
                     }
                 }
             }
@@ -174,6 +231,8 @@ object WakeEngine {
             try { ar?.stop() } catch (_: Exception) {}
             try { ar?.release() } catch (_: Exception) {}
             try { gate?.close() } catch (_: Exception) {}
+            try { cmd?.close() } catch (_: Exception) {}
+            try { agc?.release() } catch (_: Exception) {}
             try { free?.close() } catch (_: Exception) {}
             try { model?.close() } catch (_: Exception) {}
         }

@@ -34,3 +34,9 @@ New in 3.5:
   behind, old queued speech is dropped so you always hear the latest text.
 - One bad message or an error while speaking can no longer drop the connection.
 - The first reconnect after a drop happens after 1 second instead of 2.
+
+Voice accuracy (offline engine):
+- The offline recogniser is now restricted to the words that can be a command (keys, modifiers, numbers, built-in phrases, your macro phrases, the wake word),
+  so short commands are no longer confused with similar-sounding words. Anything outside that list ("type hello", dictation) still uses open recognition.
+- If the wake-word detector heard the wake word but the full text spelled it differently, the command is no longer dropped silently.
+- Automatic gain control is switched on for the microphone when the phone offers it.
